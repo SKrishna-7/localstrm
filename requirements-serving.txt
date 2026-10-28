@@ -1,0 +1,9 @@
+# Mini-vLLM: Optional OpenAI-Compatible HTTP Serving & Observability
+# -------------------------------------------------------------------
+# Required for `cli.py serve`, FastAPI endpoints, and Prometheus metrics.
+# Install alongside requirements.txt:
+#   pip install -r requirements-serving.txt
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+prometheus-client>=0.19.0

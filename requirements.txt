@@ -1,0 +1,8 @@
+# Mini-vLLM: Core Runtime Inference Dependencies
+# ----------------------------------------------------
+# IMPORTANT: For GPU execution, install a CUDA-enabled PyTorch build
+# first matching your NVIDIA driver. See INSTALL.md for details.
+torch>=2.1.0
+transformers>=4.36.0
+huggingface-hub>=0.20.0
+psutil>=5.9.0

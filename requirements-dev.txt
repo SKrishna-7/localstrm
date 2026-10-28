@@ -1,0 +1,13 @@
+# Mini-vLLM: Development, Test Suite & Benchmarking Dependencies
+# --------------------------------------------------------------
+# Includes core runtime, serving stack, test framework, and profilers.
+# Install via:
+#   pip install -r requirements-dev.txt
+-r requirements.txt
+-r requirements-serving.txt
+pytest>=7.4.0
+httpx>=0.25.0
+openai>=1.0.0
+numpy>=1.26.0
+matplotlib>=3.7.0
+nvidia-ml-py>=12.535.133
