@@ -4,7 +4,6 @@
 
 [![Python: 3.11](https://img.shields.io/badge/Python-3.11-green.svg)](INSTALL.md)
 [![PyTorch: 2.1+](https://img.shields.io/badge/PyTorch-2.1%2B-orange.svg)](https://pytorch.org/)
-[![Test Suite: 193 Tests](https://img.shields.io/badge/Test%20Suite-193%20Tests-brightgreen.svg)](tests/)
 
 ---
 
