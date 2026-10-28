@@ -8,7 +8,7 @@ performance profiling for the Mini-vLLM inference engine:
    - vllm_gpu_cache_usage_factor (KV cache physical pool saturation)
    - vllm_num_requests_running (Active concurrent batch size)
    - vllm_num_requests_waiting (Pending scheduler queue depth)
-   - vllm_prefix_cache_hit_rate (Radix deduplication efficiency)
+   - vllm_prefix_cache_hit_rate (Chained block-hash deduplication efficiency)
 
 2. Latency Distributions (p50, p90, p95, p99):
    - TTFT (Time to First Token / Prefill latency)
@@ -123,7 +123,7 @@ class EngineMetricsTracker:
         )
         self.prom_gauges["prefix_hits"] = Gauge(
             "vllm_prefix_cache_hit_rate",
-            "Ratio of prefix tokens reused via Radix block deduplication",
+            "Ratio of prefix tokens reused via chained block-hash deduplication",
             ["model"],
             registry=self.registry
         )

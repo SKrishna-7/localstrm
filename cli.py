@@ -793,8 +793,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser_engine.add_argument("--block-size", type=int, default=16, help="Tokens per physical block")
     parser_engine.add_argument("--quant", type=str, choices=["none", "int8", "int4", "hybrid_int8"], default="none", help="Optional weight quantization")
     parser_engine.add_argument("--kv-cache-dtype", type=str, choices=["fp16", "int8"], default="fp16", help="KV cache storage dtype (default: fp16, int8 cuts KV memory by 50%%)")
-    parser_engine.add_argument("--prefix-cache", action="store_true", default=True, help="Enable automatic prefix caching (default: enabled)")
-    parser_engine.add_argument("--no-prefix-cache", action="store_false", dest="prefix_cache", help="Disable automatic prefix caching")
+    parser_engine.add_argument("--prefix-cache", action="store_true", default=True, help="Enable automatic chained block-hash prefix caching (default: enabled)")
+    parser_engine.add_argument("--no-prefix-cache", action="store_false", dest="prefix_cache", help="Disable automatic chained block-hash prefix caching")
     parser_engine.add_argument("--chunked-prefill", action="store_true", default=True, help="Enable chunked prefill (default: enabled)")
     parser_engine.add_argument("--no-chunked-prefill", action="store_false", dest="chunked_prefill", help="Disable chunked prefill (use monolithic)")
     parser_engine.add_argument("--chunk-size", type=int, default=32, help="Tokens per prefill chunk (default: 32)")
@@ -823,7 +823,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser_quant.add_argument("--quant", type=str, choices=["none", "int8", "int4", "hybrid_int8"], default="int8", help="Quantization mode (default: int8)")
 
     # Subcommand: prefix-cache
-    parser_pc = subparsers.add_parser("prefix-cache", parents=[parent_parser], help="Benchmark automatic prefix caching & deduplication")
+    parser_pc = subparsers.add_parser("prefix-cache", parents=[parent_parser], help="Benchmark automatic chained block-hash prefix caching & deduplication")
     parser_pc.add_argument("--system-prompt", type=str, default=None, help="Shared system prefix")
     parser_pc.add_argument("--query", type=str, action="append", help="User queries sharing prefix (can specify multiple times)")
 

@@ -8,7 +8,7 @@ Comparative Dimensions Measured:
   1. Throughput (Tokens/Second) & Speedup Factor
   2. Latency Distributions (TTFT & TPOT: Mean, P50, P95, P99)
   3. Execution Bubble & GPU Idle Slots Waste (Orca / OSDI '22)
-  4. Automatic Prefix Caching (Radix Hit Rate & TTFT Drop)
+  4. Automatic Prefix Caching (Chained Block-Hash Hit Rate & TTFT Drop)
   5. KV Cache Memory Footprint (FP16 vs INT8 Quantization)
   6. Queueing Delays under Dynamic Traffic
 """
@@ -240,7 +240,7 @@ def run_minivllm_advanced_serving(
     Executes the advanced Mini-vLLM Engine:
       - Continuous (Iteration-Level) Batching: 0% execution bubble waste!
       - PagedAttention: Non-contiguous physical KV paging.
-      - Automatic Prefix Caching: Radix block reuse (0ms prefill for shared prompts).
+      - Automatic Prefix Caching: Chained block-hash reuse (0ms prefill for shared prompts).
       - INT8 KV Cache support (50% memory footprint reduction).
       - Chunked Prefill (eliminating decode latency spikes).
     """

@@ -1,12 +1,12 @@
-# Mini-vLLM Installation and Environment Setup Guide
+# LocalStrm Installation and Environment Setup Guide
 
-This guide describes how to configure a reproducible Python environment for Mini-vLLM on Linux with NVIDIA GPU acceleration.
+This guide describes how to configure a reproducible Python environment for LocalStrm on Linux with NVIDIA GPU acceleration.
 
 ---
 
 ## 1. System Requirements & Hardware Targets
 
-- **Operating System:** Linux (Ubuntu 22.04 LTS or newer verified).
+- **Operating System:** Linux verified (Ubuntu 22.04 LTS or newer), Windows untested/best-effort.
 - **Python:** Tested on **Python 3.11.15** (compatible with Python 3.10+).
 - **GPU Target:** NVIDIA GPU with CUDA Compute Capability $\ge 7.0$ for basic engine inference.
   - *Note on INT8 GEMM (`hybrid_int8`):* Requires **CUDA Compute Capability $\ge 8.0$ (Ampere / Ada Lovelace / Hopper)**. The engine's runtime check (`src/kernels/quantization.py:can_use_int8_gemm`) enforces `capability >= (8, 0)` and will automatically fall back to cached FP16 dequantization if run on older architectures (e.g. Turing SM 7.5 or Volta SM 7.0).
@@ -38,11 +38,13 @@ Select the wheel channel corresponding to your installed NVIDIA driver:
 
 ```bash
 # For CUDA 12.1 (Recommended for most modern drivers):
-pip install torch>=2.1.0 --index-url https://download.pytorch.org/whl/cu121
+pip install "torch>=2.1.0" --index-url https://download.pytorch.org/whl/cu121
 
 # For CUDA 12.4:
-pip install torch>=2.1.0 --index-url https://download.pytorch.org/whl/cu124
+pip install "torch>=2.1.0" --index-url https://download.pytorch.org/whl/cu124
 ```
+
+> **Note:** Reported benchmarks used PyTorch 2.13.0+cu132 and Python 3.11.15 on CUDA 13.2.
 
 Verify that CUDA is accessible in PyTorch:
 
@@ -52,7 +54,7 @@ python -c "import torch; print('CUDA available:', torch.cuda.is_available(), '| 
 
 ---
 
-## 3. Install Mini-vLLM Dependencies
+## 3. Install LocalStrm Dependencies
 
 Choose the dependency profile suited to your intended workflow:
 
@@ -82,7 +84,7 @@ pip install -r requirements-dev.txt
 
 ## 4. Environment Variables Configuration
 
-Mini-vLLM requires the repository root to be in the Python module search path. Set the following environment variables in your shell or `.env`:
+LocalStrm requires the repository root to be in the Python module search path. Set the following environment variables in your shell or `.env`:
 
 ```bash
 # Mandatory: enable root module resolution (e.g. import src.engine.llm_engine)
