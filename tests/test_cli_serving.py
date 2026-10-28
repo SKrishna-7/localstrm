@@ -174,6 +174,14 @@ def test_cli_parser_default_engine_selection():
     assert args.total_blocks is None
     assert args.vram_budget is None
     assert args.kv_cache_dtype == "fp16"
+    assert args.host == "127.0.0.1"
+
+
+def test_cli_parser_serve_default_host():
+    """Validates that cli.py serve defaults to localhost (127.0.0.1) for security."""
+    parser = build_parser()
+    args = parser.parse_args(["serve"])
+    assert args.host == "127.0.0.1"
 
 
 def test_cli_parser_explicit_minivllm_selection():

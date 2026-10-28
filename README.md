@@ -490,12 +490,12 @@ python cli.py models
 Launches an OpenAI-compatible REST API server powered by FastAPI and Uvicorn.
 
 ```bash
-python cli.py serve --engine mini-vllm --model Qwen/Qwen2.5-0.5B --host 0.0.0.0 --port 8000
+python cli.py serve --engine mini-vllm --model Qwen/Qwen2.5-0.5B --host 127.0.0.1 --port 8000
 ```
 
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--host STR` | String | `0.0.0.0` | Network interface address to bind the HTTP server. |
+| `--host STR` | String | `127.0.0.1` | Network interface address to bind the HTTP server. The server provides no built-in authentication; binding to 0.0.0.0 exposes the API to the local network or internet. |
 | `--port INT` | Integer | `8000` | TCP port to listen for incoming HTTP connections. |
 | `--quant {none,int8,int4,hybrid_int8}` | String | `none` | Optional model weight quantization. |
 | `--engine {hf,mini-vllm}` | String | `hf` | Serving backend engine. Choose `mini-vllm` for true continuous batching or `hf` for sequential Hugging Face serving. |
@@ -629,7 +629,7 @@ Launch the HTTP server backed by the LocalStrm continuous batching engine:
 python cli.py serve \
   --engine mini-vllm \
   --model Qwen/Qwen2.5-0.5B \
-  --host 0.0.0.0 \
+  --host 127.0.0.1 \
   --port 8000 \
   --batch-size 8 \
   --kv-cache-dtype int8
@@ -863,4 +863,4 @@ The repository includes an automated regression test suite covering the core eng
 
 ## License
 
-No license is currently provided. Public visibility does not grant general permission to use, modify, redistribute, or incorporate the code into other projects. Applicable copyright law and platform terms still apply.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
