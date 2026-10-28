@@ -25,10 +25,27 @@ except ImportError:
     psutil = None
 
 try:
-    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 except ImportError:
     HfApi = None
     hf_hub_download = None
+    snapshot_download = None
+
+try:
+    from huggingface_hub.constants import HF_HUB_CACHE
+except ImportError:
+    HF_HUB_CACHE = os.path.expanduser("~/.cache/huggingface/hub")
+
+
+# Module-level single source of truth constants for hardware and memory budgeting
+SAFETY_MARGIN_FRACTION: float = 0.05  # 5% safety margin on GPU VRAM
+DISK_SAFETY_BUFFER_FRACTION: float = 0.10  # 10% safety buffer on disk download capacity
+CUDA_CONTEXT_BYTES: int = int(450 * (1024**2))  # 450 MiB CUDA runtime, driver tables & cuBLAS handles
+CPU_OVERHEAD_BYTES: int = int(400 * (1024**2))  # 400 MiB CPU runtime activation overhead
+CHUNKED_WORKSPACE_BYTES: int = int(64 * (1024**2))  # 64 MiB execution workspace for chunked prefill
+MONOLITHIC_WORKSPACE_BYTES: int = int(450 * (1024**2))  # 450 MiB execution workspace for monolithic prefill
+DEFAULT_SAFETY_MARGIN_BYTES: int = int(128 * (1024**2))  # 128 MiB static VRAM safety buffer
+
 
 
 def format_bytes(num_bytes: int) -> str:
@@ -210,13 +227,82 @@ class PreflightReport:
     recommendations: List[str] = field(default_factory=list)
 
 
+def _get_hf_cache_dir(cache_dir: Optional[str] = None) -> str:
+    """Resolves the Hugging Face hub cache directory.
+
+    Honors explicit cache_dir, HF_HUB_CACHE, and HF_HOME environment variables,
+    falling back to huggingface_hub.constants.HF_HUB_CACHE.
+    """
+    if cache_dir is not None:
+        return cache_dir
+    if "HF_HUB_CACHE" in os.environ:
+        return os.path.expandvars(os.path.expanduser(os.environ["HF_HUB_CACHE"]))
+    if "HF_HOME" in os.environ:
+        return os.path.join(os.environ["HF_HOME"], "hub")
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE as _HUB_CACHE
+        return str(_HUB_CACHE)
+    except ImportError:
+        return os.path.expanduser("~/.cache/huggingface/hub")
+
+
+def filter_weight_files(file_entries: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
+    """Filters candidate weight files to prevent double-counting when multiple serialization formats exist.
+
+    If any .safetensors files are present in file_entries, only the .safetensors files are returned.
+    Otherwise, returns any .bin or .pt files.
+
+    Note: This covers the common Hugging Face repository layout where models are provided
+    in both SafeTensors and legacy PyTorch (.bin/.pt) formats. It does not handle exotic
+    multi-format configurations.
+    """
+    safetensors = [entry for entry in file_entries if entry[0].endswith(".safetensors")]
+    if safetensors:
+        return safetensors
+    return [entry for entry in file_entries if entry[0].endswith((".bin", ".pt"))]
+
+
+def _inspect_local_model_directory(directory_path: str) -> ModelMetadata:
+    """Extracts lightweight metadata from a local directory or cached snapshot."""
+    raw_files: List[Tuple[str, int]] = []
+    for root, _, files in os.walk(directory_path):
+        for f in files:
+            if f.endswith((".safetensors", ".bin", ".pt")):
+                fp = os.path.join(root, f)
+                try:
+                    raw_files.append((f, os.path.getsize(fp)))
+                except OSError:
+                    pass
+
+    selected_files = filter_weight_files(raw_files)
+    weight_bytes = sum(sz for _, sz in selected_files)
+
+    cfg_file = os.path.join(directory_path, "config.json")
+    meta = ModelMetadata(model_id=directory_path, is_local=True, weight_bytes=weight_bytes)
+    if os.path.exists(cfg_file):
+        try:
+            import json
+            with open(cfg_file, "r", encoding="utf-8") as f:
+                raw_cfg = json.load(f)
+            cfg_dict = raw_cfg.get("text_config", raw_cfg) if isinstance(raw_cfg, dict) else {}
+            meta.hidden_size = cfg_dict.get("hidden_size")
+            meta.num_layers = cfg_dict.get("num_hidden_layers")
+            meta.num_heads = cfg_dict.get("num_attention_heads")
+            meta.num_kv_heads = cfg_dict.get("num_key_value_heads", meta.num_heads)
+            meta.head_dim = cfg_dict.get("head_dim", (meta.hidden_size // meta.num_heads) if meta.hidden_size and meta.num_heads else 64)
+            meta.vocab_size = cfg_dict.get("vocab_size")
+        except Exception:
+            pass
+
+    if meta.weight_bytes > 0 and meta.parameter_count is None:
+        meta.parameter_count = int(meta.weight_bytes // 2)
+    return meta
+
+
 def get_hardware_capacity(device_str: str = "cuda") -> HardwareCapacity:
     """Inspects host GPU, CPU, and disk storage capacity."""
     # 1. Disk capacity for HuggingFace cache
-    cache_dir = os.getenv(
-        "HF_HOME",
-        os.path.expanduser("~/.cache/huggingface/hub")
-    )
+    cache_dir = _get_hf_cache_dir()
     os.makedirs(cache_dir, exist_ok=True)
     try:
         disk_usage = shutil.disk_usage(cache_dir)
@@ -267,34 +353,7 @@ def get_model_metadata(model_id: str) -> ModelMetadata:
     """
     # 1. Local filesystem path check
     if os.path.exists(model_id) and os.path.isdir(model_id):
-        weight_bytes = 0
-        for root, _, files in os.walk(model_id):
-            for f in files:
-                if f.endswith((".safetensors", ".bin", ".pt")):
-                    weight_bytes += os.path.getsize(os.path.join(root, f))
-
-        # Try reading config.json
-        cfg_file = os.path.join(model_id, "config.json")
-        meta = ModelMetadata(model_id=model_id, is_local=True, weight_bytes=weight_bytes)
-        if os.path.exists(cfg_file):
-            import json
-            try:
-                with open(cfg_file, "r") as f:
-                    cfg = json.load(f)
-                meta.hidden_size = cfg.get("hidden_size")
-                meta.num_layers = cfg.get("num_hidden_layers")
-                meta.num_heads = cfg.get("num_attention_heads")
-                meta.num_kv_heads = cfg.get("num_key_value_heads", meta.num_heads)
-                meta.head_dim = cfg.get("head_dim", (meta.hidden_size // meta.num_heads) if meta.hidden_size and meta.num_heads else 64)
-                meta.vocab_size = cfg.get("vocab_size")
-            except Exception:
-                pass
-        # Keep the local path consistent with remote metadata handling below.
-        # This is the existing lightweight estimate used when only weight bytes
-        # are available; it does not load model tensors.
-        if meta.weight_bytes > 0 and meta.parameter_count is None:
-            meta.parameter_count = int(meta.weight_bytes // 2)
-        return meta
+        return _inspect_local_model_directory(model_id)
 
     # 2. Remote HuggingFace Hub metadata check
     meta = ModelMetadata(model_id=model_id, is_local=False)
@@ -304,19 +363,44 @@ def get_model_metadata(model_id: str) -> ModelMetadata:
             api = HfApi()
             info = api.model_info(model_id, files_metadata=True)
 
-            # Calculate total download size from file siblings
-            weight_files = [
-                s for s in (info.siblings or [])
+            # Calculate total download size from file siblings, avoiding double-counting
+            raw_siblings = [
+                (s.rfilename, s.size)
+                for s in (info.siblings or [])
                 if s.size and s.rfilename.endswith((".safetensors", ".bin", ".pt"))
             ]
-            if weight_files:
-                meta.weight_bytes = sum(s.size for s in weight_files)
+            selected_siblings = filter_weight_files(raw_siblings)
+            if selected_siblings:
+                meta.weight_bytes = sum(sz for _, sz in selected_siblings)
 
             # Check safetensors parameter metadata
             if getattr(info, "safetensors", None) and getattr(info.safetensors, "total", None):
                 meta.parameter_count = info.safetensors.total
         except Exception:
-            pass
+            # When offline (e.g. HF_HUB_OFFLINE=1), model_info() fails.
+            # Before giving up, attempt to resolve a local cached snapshot:
+            try:
+                from huggingface_hub import snapshot_download as _snap_dl
+                local_snapshot_dir = _snap_dl(model_id, cache_dir=_get_hf_cache_dir(), local_files_only=True)
+                if local_snapshot_dir and os.path.isdir(local_snapshot_dir):
+                    local_meta = _inspect_local_model_directory(local_snapshot_dir)
+                    local_meta.model_id = model_id
+                    local_meta.is_local = False
+                    return local_meta
+            except Exception:
+                pass
+
+            # Also check directly in resolved cache_dir/models--.../snapshots
+            repo_folder_name = "models--" + model_id.replace("/", "--")
+            cached_snapshots = os.path.join(_get_hf_cache_dir(), repo_folder_name, "snapshots")
+            if os.path.exists(cached_snapshots):
+                revs = [d for d in os.listdir(cached_snapshots) if os.path.isdir(os.path.join(cached_snapshots, d))]
+                if revs:
+                    latest_snap = os.path.join(cached_snapshots, revs[-1])
+                    local_meta = _inspect_local_model_directory(latest_snap)
+                    local_meta.model_id = model_id
+                    local_meta.is_local = False
+                    return local_meta
 
     # 3. Download and inspect lightweight config.json (~3 KB) if architectural info is needed
     if hf_hub_download and (meta.num_layers is None or meta.hidden_size is None):
@@ -385,17 +469,44 @@ def validate_model_preflight(
 
     effective_weight_bytes = int(meta.weight_bytes * quant_multiplier)
 
-    # 2. Calculate KV Cache footprint
-    num_layers = meta.num_layers or 24
-    num_kv_heads = meta.num_kv_heads or 2
-    head_dim = meta.head_dim or 64
+    # 2. Check for missing architectural metadata before computing KV cache
+    missing_arch_fields = []
+    if meta.num_layers is None or meta.num_layers <= 0:
+        missing_arch_fields.append("num_hidden_layers")
+    if meta.num_kv_heads is None or meta.num_kv_heads <= 0:
+        missing_arch_fields.append("num_key_value_heads")
+    if meta.head_dim is None or meta.head_dim <= 0:
+        missing_arch_fields.append("head_dim")
+
+    if missing_arch_fields:
+        recs = [
+            f"Incomplete model architectural configuration: missing required fields {missing_arch_fields}. "
+            "Cannot reliably estimate KV-cache memory requirements before execution."
+        ]
+        return PreflightReport(
+            model_id=model_id,
+            device=hw.device_type,
+            quantization=quantization,
+            parameter_count=meta.parameter_count,
+            download_size_bytes=meta.weight_bytes,
+            runtime_memory_needed=0,
+            hardware_available_memory=hw.available_memory,
+            disk_available_bytes=hw.disk_free,
+            fits_memory=False,
+            fits_disk=False,
+            can_run=force,
+            recommendations=recs
+        )
+
+    num_layers = meta.num_layers
+    num_kv_heads = meta.num_kv_heads
+    head_dim = meta.head_dim
     bytes_per_elem = 2  # FP16
     kv_cache_per_token = 2 * num_layers * num_kv_heads * head_dim * bytes_per_elem
     total_kv_cache = kv_cache_per_token * max_context * batch_size
 
     # 3. Runtime Activation Buffers & Context Overhead
-    # (CUDA context ~500 MB + temporary activation buffers ~300 MB)
-    runtime_overhead = int(800 * (1024**2)) if hw.device_type == "cuda" else int(400 * (1024**2))
+    runtime_overhead = CUDA_CONTEXT_BYTES if hw.device_type == "cuda" else CPU_OVERHEAD_BYTES
 
     total_memory_needed = effective_weight_bytes + total_kv_cache + runtime_overhead
 
@@ -403,7 +514,7 @@ def validate_model_preflight(
     if meta.weight_bytes == 0 and meta.parameter_count is None:
         fits_memory = False
         fits_disk = False
-        can_run = False or force
+        can_run = force
         recs = [
             "Could not retrieve model metadata or weight sizes from repository. "
             "Verify that the model ID exists, is spelled correctly, and is publicly accessible (or authenticate with HF_TOKEN)."
@@ -423,8 +534,8 @@ def validate_model_preflight(
             recommendations=recs
         )
 
-    # Require at least a 10% safety margin on GPU VRAM
-    available_with_margin = int(hw.available_memory * 0.95)
+    # Require at least a 5% safety margin on GPU VRAM
+    available_with_margin = int(hw.available_memory * (1.0 - SAFETY_MARGIN_FRACTION))
     fits_memory = total_memory_needed <= available_with_margin
 
     # Check disk download space (needs uncompressed weights + 10% buffer if remote and not already cached)
@@ -437,7 +548,7 @@ def validate_model_preflight(
             is_cached = True
 
     download_needed = 0 if (meta.is_local or is_cached) else meta.weight_bytes
-    fits_disk = (download_needed * 1.1) <= hw.disk_free
+    fits_disk = (download_needed * (1.0 + DISK_SAFETY_BUFFER_FRACTION)) <= hw.disk_free
 
     # 5. Formulate tailored recommendations
     recs = []
@@ -591,11 +702,11 @@ def estimate_vram_budget(
     # 4. Runtime overhead, workspace, and safety margin
     if runtime_overhead_bytes is None:
         # CUDA context (~450 MiB on Linux/RTX 4050) covers driver tables, JIT cache, cublas handles
-        runtime_overhead_bytes = int(450 * (1024**2)) if hw.device_type == "cuda" else 0
+        runtime_overhead_bytes = CUDA_CONTEXT_BYTES if hw.device_type == "cuda" else 0
     if execution_workspace_bytes is None:
-        execution_workspace_bytes = int(64 * (1024**2)) if chunked_prefill else int(450 * (1024**2))
+        execution_workspace_bytes = CHUNKED_WORKSPACE_BYTES if chunked_prefill else MONOLITHIC_WORKSPACE_BYTES
     if safety_margin_bytes is None:
-        safety_margin_bytes = int(128 * (1024**2))
+        safety_margin_bytes = DEFAULT_SAFETY_MARGIN_BYTES
 
     non_kv_bytes = (
         model_resident_bytes
@@ -763,12 +874,7 @@ def list_installed_models(
     Scans local Hugging Face cache and local model directories to report installed
     models, their size on disk, architecture, and whether full weights are downloaded.
     """
-    if cache_dir is None:
-        hf_home = os.getenv("HF_HOME")
-        if hf_home:
-            cache_dir = os.path.join(hf_home, "hub") if not hf_home.endswith("hub") else hf_home
-        else:
-            cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+    cache_dir = _get_hf_cache_dir(cache_dir)
 
     results: List[InstalledModelInfo] = []
     scanned_repos = set()
@@ -947,9 +1053,7 @@ def print_installed_models_report(
     DIM = "\033[2m"
     RESET = "\033[0m"
 
-    if cache_dir is None:
-        hf_home = os.getenv("HF_HOME")
-        cache_dir = os.path.join(hf_home, "hub") if hf_home else os.path.expanduser("~/.cache/huggingface/hub")
+    cache_dir = _get_hf_cache_dir(cache_dir)
 
     print(f"\n{CYAN}{BOLD}╔═══════════════════════════════════════════════════════════════════════════╗{RESET}")
     print(f"{CYAN}{BOLD}║                 📦 LOCALLY INSTALLED & CACHED MODELS REPORT               ║{RESET}")
