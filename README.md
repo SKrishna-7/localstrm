@@ -4,7 +4,7 @@
 
 [![Python: 3.11](https://img.shields.io/badge/Python-3.11-green.svg)](INSTALL.md)
 [![PyTorch: 2.1+](https://img.shields.io/badge/PyTorch-2.1%2B-orange.svg)](https://pytorch.org/)
-[![Test Suite: 193 Tests](https://img.shields.io/badge/Test%20Suite-193%20Tests-brightgreen.svg)](tests/)
+[![Test Suite: 206 Tests](https://img.shields.io/badge/Test%20Suite-206%20Tests-brightgreen.svg)](tests/)
 
 ---
 
@@ -835,14 +835,14 @@ We compared dynamic INT8 execution with LocalStrm's Hybrid INT8 execution using 
 ### Test Suite
 
 The repository includes an automated regression test suite covering the core engine and serving subsystems:
-- **193 tests collected across 19 test modules** (`pytest tests/ --collect-only -q`).
-- Test execution is split between **16 offline test modules** (executable without internet access or model downloads) and **3 model-dependent modules** (requiring local cached weights of `Qwen/Qwen2.5-0.5B`). See [`INSTALL.md`](INSTALL.md) for execution details. In the verified offline run, **182 tests passed**; **11 model-dependent tests remain unexecuted** until the checkpoint is available locally.
-- Tests validate: physical block allocation, block recycling, prefix cache chained block hashing, victim preemption under memory starvation, greedy sampling reproducibility, GQA dimensions, CPU-staged quantization loading, `torch._int_mm` fallbacks, preflight fail-closed guards, and live HTTP FastAPI lifecycle events.
+- **206 tests collected across 19 test modules** (`pytest tests/ --collect-only -q`).
+- Test execution is split between **16 offline test modules** (executable without internet access or model downloads, 195 tests) and **3 model-dependent modules** (requiring local cached weights of `Qwen/Qwen2.5-0.5B`, 11 tests). See [`INSTALL.md`](INSTALL.md) for execution details. All **195 offline tests passed**; all **11 model-dependent integration tests passed** when cached weights are present (206/206 total passing).
+- Tests validate: physical block allocation, block recycling, prefix cache chained block hashing, victim preemption under memory starvation, greedy sampling reproducibility, GQA dimensions, CPU-staged quantization loading, `torch._int_mm` fallbacks, preflight fail-closed guards, live HTTP FastAPI lifecycle events, multi-token stopping criteria vocabulary verification, INT4 slice dequantization numerical equivalence, and fail-closed architecture guards.
 
 ### Supported Model Architectures
 
-- **Architecture pattern:** Decoder-only transformer architectures following the LLaMA / Qwen2 design (`model.layers[i]`, RMSNorm, RoPE, and Grouped Query Attention). End-to-end GPU validation in the recorded tests uses `Qwen/Qwen2.5-0.5B`; other structurally compatible models should be validated individually.
-- **Incompatible with `--engine mini-vllm`:** Encoder-decoder models (T5), non-standard architectures (Bloom, Falcon, GPT-2), and mixture-of-experts architectures without dense projections. For non-supported models, use `--engine hf`.
+- **Architecture pattern:** Decoder-only transformer architectures following the standard LLaMA / Qwen2 / Mistral design (`model.layers[i]`, RMSNorm, RoPE, and Grouped Query Attention). End-to-end GPU validation in the recorded tests uses `Qwen/Qwen2.5-0.5B` and `Qwen/Qwen2.5-Coder-1.5B-Instruct`; other structurally compatible decoder-only transformers should be validated individually.
+- **Incompatible with `--engine mini-vllm`:** Hybrid convolution / State-Space Models (SSM) such as LiquidAI LFM3 (`liquid_lfm`), encoder-decoder models (T5), non-standard attention models (Bloom, Falcon, GPT-2), and mixture-of-experts architectures without dense projections. For non-supported models or custom architectures, use `--engine hf`.
 
 ### Known Limitations
 
