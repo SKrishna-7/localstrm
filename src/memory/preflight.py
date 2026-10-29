@@ -346,7 +346,7 @@ def get_hardware_capacity(device_str: str = "cuda") -> HardwareCapacity:
         )
 
 
-def get_model_metadata(model_id: str) -> ModelMetadata:
+def get_model_metadata(model_id: str, trust_remote_code: bool = False) -> ModelMetadata:
     """
     Fetches lightweight metadata for a local directory or remote HuggingFace model
     WITHOUT downloading model weight tensors.
@@ -425,7 +425,7 @@ def get_model_metadata(model_id: str) -> ModelMetadata:
     if meta.hidden_size is None or meta.num_layers is None:
         try:
             from transformers import AutoConfig
-            cfg = AutoConfig.from_pretrained(model_id)
+            cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
             meta.hidden_size = getattr(cfg, "hidden_size", None)
             meta.num_layers = getattr(cfg, "num_hidden_layers", None)
             meta.num_heads = getattr(cfg, "num_attention_heads", None)
@@ -450,13 +450,14 @@ def validate_model_preflight(
     quantization: str = "none",
     batch_size: int = 1,
     max_context: int = 2048,
-    force: bool = False
+    force: bool = False,
+    trust_remote_code: bool = False
 ) -> PreflightReport:
     """
     Validates whether a model can be safely downloaded and executed on the host system.
     """
     hw = get_hardware_capacity(device)
-    meta = get_model_metadata(model_id)
+    meta = get_model_metadata(model_id, trust_remote_code=trust_remote_code)
 
     # 1. Scale weights by quantization factor
     quant_multiplier = 1.0
@@ -611,6 +612,7 @@ def estimate_vram_budget(
     metadata: Optional[ModelMetadata] = None,
     hardware: Optional[HardwareCapacity] = None,
     raise_on_error: bool = True,
+    trust_remote_code: bool = False,
 ) -> VRAMBudgetEstimate:
     """Estimates static KV cache capacity from a user VRAM budget before loading weights.
 
@@ -621,7 +623,7 @@ def estimate_vram_budget(
     hw = hardware if hardware is not None else get_hardware_capacity(device)
     hw_avail = hw.available_memory
 
-    meta = metadata if metadata is not None else get_model_metadata(model_id)
+    meta = metadata if metadata is not None else get_model_metadata(model_id, trust_remote_code=trust_remote_code)
 
     # 1. Validate architectural metadata
     missing_fields = []
@@ -794,13 +796,20 @@ def enforce_preflight_check(
     model_id: str,
     device: str = "cuda",
     quantization: str = "none",
-    force: bool = False
+    force: bool = False,
+    trust_remote_code: bool = False
 ) -> PreflightReport:
     """
     Enforces the pre-flight check. If the model will NOT fit in the system,
     prints a clear diagnostic alert and halts BEFORE downloading weights.
     """
-    report = validate_model_preflight(model_id, device=device, quantization=quantization, force=force)
+    report = validate_model_preflight(
+        model_id,
+        device=device,
+        quantization=quantization,
+        force=force,
+        trust_remote_code=trust_remote_code
+    )
 
     # ANSI Colors
     RED = "\033[91m"

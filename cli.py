@@ -68,7 +68,11 @@ def print_banner():
 def cmd_inspect(args):
     """Subcommand: Inspect model architecture, parameter weights, and VRAM budget."""
     from benchmarks.inspect_model import inspect_model_memory
-    inspect_model_memory(model_name=args.model, device=args.device)
+    inspect_model_memory(
+        model_name=args.model,
+        device=args.device,
+        trust_remote_code=getattr(args, "trust_remote_code", False)
+    )
 
 
 def cmd_benchmark(args):
@@ -79,7 +83,8 @@ def cmd_benchmark(args):
     enforce_preflight_check(
         args.model,
         device=args.device,
-        force=getattr(args, "force", False)
+        force=getattr(args, "force", False),
+        trust_remote_code=getattr(args, "trust_remote_code", False)
     )
 
     prompts = args.prompt
@@ -122,7 +127,8 @@ def cmd_engine(args):
         args.model,
         device=args.device,
         quantization=args.quant,
-        force=getattr(args, "force", False)
+        force=getattr(args, "force", False),
+        trust_remote_code=getattr(args, "trust_remote_code", False)
     )
 
     prompts = args.prompt
@@ -532,7 +538,8 @@ def cmd_serve(args):
             device=args.device,
             quantization=args.quant,
             kv_cache_dtype=getattr(args, "kv_cache_dtype", "fp16"),
-            verbose=args.verbose
+            verbose=args.verbose,
+            trust_remote_code=getattr(args, "trust_remote_code", False)
         )
         engine = AsyncServingAdapter(core_engine)
     else:
@@ -542,7 +549,8 @@ def cmd_serve(args):
             model_name=args.model,
             device=args.device,
             quantization=args.quant,
-            force=getattr(args, "force", False)
+            force=getattr(args, "force", False),
+            trust_remote_code=getattr(args, "trust_remote_code", False)
         )
 
     app = create_app(engine)
@@ -583,11 +591,13 @@ def cmd_chat(args):
     device_str = args.device or get_default_device()
     device = torch.device(device_str)
 
+    trust_remote = getattr(args, "trust_remote_code", False)
     enforce_preflight_check(
         args.model,
         device=device_str,
         quantization=args.quant,
-        force=getattr(args, "force", False)
+        force=getattr(args, "force", False),
+        trust_remote_code=trust_remote
     )
 
     print_banner()
@@ -602,20 +612,49 @@ def cmd_chat(args):
     # 1. Load Tokenizer & Model (with CPU-staged quantization if enabled)
     print(f"{Colors.YELLOW}Loading model weights...{Colors.RESET}", end="", flush=True)
     t0 = time.perf_counter()
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=trust_remote)
     dtype = torch.float32 if device.type == "cpu" else torch.float16
     model, orig_bytes, quant_bytes = load_and_quantize_model(
         args.model,
         device=device,
         quantization=args.quant,
-        dtype=dtype
+        dtype=dtype,
+        trust_remote_code=trust_remote
     )
     load_time = time.perf_counter() - t0
     print(f" {Colors.GREEN}Ready! ({load_time:.2f}s){Colors.RESET}")
 
+    is_chat_model = any(k in args.model.lower() for k in ("instruct", "chat", "it", "conversational"))
+    if not is_chat_model:
+        print(f" {Colors.YELLOW}[Notice] '{args.model}' appears to be a base completion model, not instruction-tuned (e.g. '*-Instruct'). Interactive chat responses may produce code/text completion rather than conversation.{Colors.RESET}")
+
     if args.quant != "none":
         savings = (1.0 - (quant_bytes / orig_bytes)) * 100 if orig_bytes > 0 else 0.0
         print(f" {Colors.GREEN}Applied {args.quant.upper()} quantization ({savings:.1f}% VRAM freed){Colors.RESET}")
+
+    # Build comprehensive set of stop token IDs (handles single int, list of ints, and template end tokens)
+    stop_token_ids = set()
+    if tokenizer.eos_token_id is not None:
+        if isinstance(tokenizer.eos_token_id, list):
+            stop_token_ids.update(tokenizer.eos_token_id)
+        else:
+            stop_token_ids.add(tokenizer.eos_token_id)
+
+    gen_config = getattr(model, "generation_config", None)
+    if gen_config is not None and getattr(gen_config, "eos_token_id", None) is not None:
+        cfg_eos = gen_config.eos_token_id
+        if isinstance(cfg_eos, list):
+            stop_token_ids.update(cfg_eos)
+        elif isinstance(cfg_eos, int):
+            stop_token_ids.add(cfg_eos)
+
+    for end_tok in ("<|im_end|>", "<|eot_id|>", "</s>"):
+        try:
+            tid = tokenizer.convert_tokens_to_ids(end_tok)
+            if isinstance(tid, int) and tid != getattr(tokenizer, "unk_token_id", None) and tid > 0:
+                stop_token_ids.add(tid)
+        except Exception:
+            pass
 
     print(f"\n{Colors.GREEN}{Colors.BOLD}● Engine online! Type your message below:{Colors.RESET}\n")
 
@@ -678,44 +717,47 @@ def cmd_chat(args):
 
         past_key_values = outputs.past_key_values
         next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        first_token_val = next_token_id.item()
 
-        first_token_str = tokenizer.decode(next_token_id[0], skip_special_tokens=True)
-        sys.stdout.write(first_token_str)
-        sys.stdout.flush()
-
-        generated_ids = [next_token_id.item()]
+        generated_ids = [first_token_val]
         decode_times = []
         curr_token = next_token_id
 
-        # Decode token-by-token with streaming
-        for _ in range(1, args.max_tokens):
-            t_step_start = time.perf_counter()
-            with torch.no_grad():
-                outputs = model(curr_token, past_key_values=past_key_values, use_cache=True)
-            t_step_end = time.perf_counter()
-            decode_times.append((t_step_end - t_step_start) * 1000)
-
-            past_key_values = outputs.past_key_values
-
-            # Sampling with temperature
-            if args.temperature > 0.0:
-                logits = outputs.logits[:, -1, :] / args.temperature
-                probs = F.softmax(logits, dim=-1)
-                curr_token = torch.multinomial(probs, num_samples=1)
-            else:
-                curr_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-
-            token_id = curr_token.item()
-            generated_ids.append(token_id)
-
-            if token_id == tokenizer.eos_token_id:
-                break
-
-            token_str = tokenizer.decode([token_id], skip_special_tokens=True)
-            sys.stdout.write(token_str)
+        if first_token_val not in stop_token_ids:
+            first_token_str = tokenizer.decode(next_token_id[0], skip_special_tokens=True)
+            sys.stdout.write(first_token_str)
             sys.stdout.flush()
 
-        assistant_reply = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            # Decode token-by-token with streaming
+            for _ in range(1, args.max_tokens):
+                t_step_start = time.perf_counter()
+                with torch.no_grad():
+                    outputs = model(curr_token, past_key_values=past_key_values, use_cache=True)
+                t_step_end = time.perf_counter()
+                decode_times.append((t_step_end - t_step_start) * 1000)
+
+                past_key_values = outputs.past_key_values
+
+                # Sampling with temperature
+                if args.temperature > 0.0:
+                    logits = outputs.logits[:, -1, :] / args.temperature
+                    probs = F.softmax(logits, dim=-1)
+                    curr_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    curr_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+
+                token_id = curr_token.item()
+                generated_ids.append(token_id)
+
+                if token_id in stop_token_ids:
+                    break
+
+                token_str = tokenizer.decode([token_id], skip_special_tokens=True)
+                sys.stdout.write(token_str)
+                sys.stdout.flush()
+
+        clean_ids = [t for t in generated_ids if t not in stop_token_ids]
+        assistant_reply = tokenizer.decode(clean_ids, skip_special_tokens=True)
         conversation_history.append({"role": "assistant", "content": assistant_reply})
 
         # Calculate metrics
@@ -755,6 +797,12 @@ def build_parent_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Bypass pre-flight system memory and hardware capacity check"
+    )
+    parent.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        default=False,
+        help="Allow executing custom modeling code defined in HuggingFace model repositories (default: False)"
     )
     parent.add_argument(
         "-l", "--list-models", "--models",

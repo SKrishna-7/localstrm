@@ -129,3 +129,127 @@ def test_cli_all_successful_requests_exit_0(capsys):
     assert "[Request #1] \033[92m[SUCCESS]\033[0m" in captured
     assert "1 succeeded, 0 failed" in captured
     assert "Duration: 4 steps" in captured
+
+
+def test_cli_trust_remote_code_flag_parsing():
+    """Verify that --trust-remote-code is parsed and defaults to False."""
+    from cli import build_parser
+
+    parser = build_parser()
+    for subcmd in ("chat", "serve", "engine", "benchmark", "inspect"):
+        args_default = parser.parse_args([subcmd])
+        assert args_default.trust_remote_code is False
+
+        args_enabled = parser.parse_args([subcmd, "--trust-remote-code"])
+        assert args_enabled.trust_remote_code is True
+
+
+def test_cmd_chat_stopping_on_im_end(capsys):
+    """
+    Regression test: Verify that cmd_chat halts token generation immediately when encountering
+    <|im_end|> (151645) or generation_config list of EOS tokens, preventing infinite generation loops.
+    """
+    from cli import cmd_chat
+    import torch
+
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.eos_token_id = 151643
+    mock_tokenizer.unk_token_id = 0
+    mock_tokenizer.chat_template = None
+    mock_tokenizer.convert_tokens_to_ids.side_effect = lambda tok: 151645 if tok == "<|im_end|>" else 0
+    mock_tokenizer.encode.return_value = torch.tensor([[10, 20]])
+    mock_tokenizer.decode.side_effect = lambda ids, **kw: "Hello" if 100 in ids else ("" if 151645 in ids else " tok")
+
+    mock_model = MagicMock()
+    mock_model.generation_config = MagicMock()
+    mock_model.generation_config.eos_token_id = [151645, 151643]
+
+    # Step 0 (prefill): output token 100 ("Hello")
+    out_prefill = MagicMock()
+    out_prefill.logits = torch.zeros((1, 1, 200000))
+    out_prefill.logits[0, 0, 100] = 10.0
+    out_prefill.past_key_values = MagicMock()
+
+    # Step 1: output token 151645 (<|im_end|>)
+    out_step1 = MagicMock()
+    out_step1.logits = torch.zeros((1, 1, 200000))
+    out_step1.logits[0, 0, 151645] = 10.0
+    out_step1.past_key_values = MagicMock()
+
+    # Step 2: if loop didn't stop, would emit token 999
+    out_step2 = MagicMock()
+    out_step2.logits = torch.zeros((1, 1, 200000))
+    out_step2.logits[0, 0, 999] = 10.0
+    out_step2.past_key_values = MagicMock()
+
+    mock_model.side_effect = [out_prefill, out_step1, out_step2]
+
+    chat_args = DummyArgs(
+        model="Qwen/Qwen2.5-Coder-1.5B",
+        max_tokens=10,
+        temperature=0.0,
+        system=None,
+        quant="none",
+        trust_remote_code=False
+    )
+
+    # Simulate user sending one message "hi" then exiting via "/exit"
+    inputs = iter(["hi", "/exit"])
+    with patch("builtins.input", side_effect=inputs), \
+         patch("src.memory.preflight.enforce_preflight_check"), \
+         patch("transformers.AutoTokenizer.from_pretrained", return_value=mock_tokenizer), \
+         patch("cli.load_and_quantize_model", return_value=(mock_model, 1000, 1000)):
+        cmd_chat(chat_args)
+
+    # Ensure model was called only twice: prefill + step 1 (stopping at 151645)
+    assert mock_model.call_count == 2
+    captured = capsys.readouterr().out
+    assert "Tokens:    2" in captured
+
+
+def test_cmd_chat_prefill_immediate_eos(capsys):
+    """
+    Regression test: Verify that if the prefill token is an EOS token, cmd_chat halts immediately
+    without entering the decode loop.
+    """
+    from cli import cmd_chat
+    import torch
+
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.eos_token_id = 151643
+    mock_tokenizer.unk_token_id = 0
+    mock_tokenizer.chat_template = None
+    mock_tokenizer.convert_tokens_to_ids.side_effect = lambda tok: 151645 if tok == "<|im_end|>" else 0
+    mock_tokenizer.encode.return_value = torch.tensor([[10, 20]])
+    mock_tokenizer.decode.return_value = ""
+
+    mock_model = MagicMock()
+    mock_model.generation_config = MagicMock()
+    mock_model.generation_config.eos_token_id = 151645
+
+    # Prefill outputs token 151645 (<|im_end|>)
+    out_prefill = MagicMock()
+    out_prefill.logits = torch.zeros((1, 1, 200000))
+    out_prefill.logits[0, 0, 151645] = 10.0
+    out_prefill.past_key_values = MagicMock()
+
+    mock_model.return_value = out_prefill
+
+    chat_args = DummyArgs(
+        model="Qwen/Qwen2.5-Coder-1.5B",
+        max_tokens=10,
+        temperature=0.0,
+        system=None,
+        quant="none",
+        trust_remote_code=False
+    )
+
+    inputs = iter(["hi", "/exit"])
+    with patch("builtins.input", side_effect=inputs), \
+         patch("src.memory.preflight.enforce_preflight_check"), \
+         patch("transformers.AutoTokenizer.from_pretrained", return_value=mock_tokenizer), \
+         patch("cli.load_and_quantize_model", return_value=(mock_model, 1000, 1000)):
+        cmd_chat(chat_args)
+
+    # Ensure model was only called once for prefill
+    assert mock_model.call_count == 1

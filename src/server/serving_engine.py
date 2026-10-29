@@ -38,26 +38,29 @@ class AsyncServingEngine:
         model_name: Optional[str] = None,
         device: Optional[str] = None,
         quantization: str = "none",
-        force: bool = False
+        force: bool = False,
+        trust_remote_code: bool = False
     ):
         self.model_name = model_name or get_default_model()
         self.device_str = device or get_default_device()
         self.device = torch.device(self.device_str)
         self.quantization = quantization.lower()
+        self.trust_remote_code = trust_remote_code
 
         # 1. Enforce memory safety
         enforce_preflight_check(
             self.model_name,
             device=self.device_str,
             quantization=self.quantization,
-            force=force
+            force=force,
+            trust_remote_code=self.trust_remote_code
         )
 
         logger.info("Initializing AsyncServingEngine with model '%s' on %s (quant=%s)...",
                     self.model_name, self.device_str, self.quantization)
 
         # 2. Load Tokenizer & Model
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=self.trust_remote_code)
         dtype = torch.float32 if self.device.type == "cpu" else torch.float16
 
         self.model, _, _ = load_and_quantize_model(
@@ -65,7 +68,8 @@ class AsyncServingEngine:
             device=self.device,
             quantization=self.quantization,
             dtype=dtype,
-            logger=logger
+            logger=logger,
+            trust_remote_code=self.trust_remote_code
         )
 
         # 4. Observability Tracker

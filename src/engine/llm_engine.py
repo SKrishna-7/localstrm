@@ -340,6 +340,7 @@ class MiniVLLMEngine:
         verbose: bool = False,
         tokenizer: Optional[Any] = None,
         model: Optional[Any] = None,
+        trust_remote_code: bool = False,
     ):
         if total_blocks is not None and vram_budget is not None:
             raise ValueError(
@@ -374,9 +375,12 @@ class MiniVLLMEngine:
                 ),
                 device=resolved_device,
                 quantization=quantization,
+                trust_remote_code=trust_remote_code,
             )
         else:
             self.config = config
+            if trust_remote_code:
+                self.config.trust_remote_code = True
             if batched_decode is not None:
                 self.config.scheduler.batched_decode = batched_decode
             if total_blocks is not None and self.config.cache.vram_budget_bytes is not None:
@@ -439,6 +443,7 @@ class MiniVLLMEngine:
                 chunked_prefill=self.chunked_prefill,
                 metadata=meta,
                 raise_on_error=True,
+                trust_remote_code=getattr(self.config, "trust_remote_code", False),
             )
             self.budget_resolution = budget_est
             self.total_blocks = budget_est.total_blocks
@@ -455,10 +460,11 @@ class MiniVLLMEngine:
             if self.budget_resolution is not None:
                 logger.info("VRAM Budget Resolution: %s", self.budget_resolution.summary())
 
+        trust_remote = getattr(self.config, "trust_remote_code", False)
         if tokenizer is not None:
             self.tokenizer = tokenizer
         else:
-            self.tokenizer = AutoTokenizer.from_pretrained(target_model)
+            self.tokenizer = AutoTokenizer.from_pretrained(target_model, trust_remote_code=trust_remote)
 
         dtype = torch.float32 if self.device.type == "cpu" else torch.float16
         if model is not None:
@@ -471,10 +477,17 @@ class MiniVLLMEngine:
                 device=self.device,
                 quantization=self.config.quantization,
                 dtype=dtype,
-                logger=logger
+                logger=logger,
+                trust_remote_code=trust_remote
             )
 
         model_cfg = self.model.config
+        if getattr(model_cfg, "num_hidden_layers", None) is None or getattr(model_cfg, "num_attention_heads", None) is None:
+            raise ValueError(
+                f"Unsupported model architecture '{model_cfg.__class__.__name__}'. "
+                f"MiniVLLMEngine requires decoder-only transformer models with standard "
+                f"attention heads and layers (e.g. LLaMA, Qwen2, Mistral)."
+            )
         self.num_layers = model_cfg.num_hidden_layers
         self.num_heads = model_cfg.num_attention_heads
         self.num_kv_heads = getattr(model_cfg, "num_key_value_heads", self.num_heads)

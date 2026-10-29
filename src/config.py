@@ -82,6 +82,7 @@ class EngineConfig:
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     device: str = field(default_factory=get_default_device)
     quantization: str = "none"
+    trust_remote_code: bool = False
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "EngineConfig":
@@ -93,6 +94,7 @@ class EngineConfig:
         total_blocks = getattr(args, "total_blocks", None)
         vram_budget = getattr(args, "vram_budget", None)
         block_size = getattr(args, "block_size", 16)
+        trust_remote_code = getattr(args, "trust_remote_code", False)
 
         vram_budget_bytes = None
         if vram_budget is not None:
@@ -119,7 +121,8 @@ class EngineConfig:
             cache=cache_cfg,
             scheduler=sched_cfg,
             device=device,
-            quantization=quant
+            quantization=quant,
+            trust_remote_code=trust_remote_code
         )
 
 

@@ -41,7 +41,11 @@ def print_memory_stats(label: str, device: torch.device):
     print(f"----------------------------------------")
 
 
-def inspect_model_memory(model_name: Optional[str] = None, device: Optional[str] = None):
+def inspect_model_memory(
+    model_name: Optional[str] = None,
+    device: Optional[str] = None,
+    trust_remote_code: bool = False
+):
     model_name = model_name or get_default_model()
     device_str = device or get_default_device()
     target_device = torch.device(device_str)
@@ -58,13 +62,14 @@ def inspect_model_memory(model_name: Optional[str] = None, device: Optional[str]
     print_memory_stats("Before Loading Model", device)
 
     print(f"\nLoading model: '{model_name}' (dtype=torch.float16)...")
-    config = AutoConfig.from_pretrained(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
-        device_map=device.type
+        device_map=device.type,
+        trust_remote_code=trust_remote_code
     )
     model.eval()
 
