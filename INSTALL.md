@@ -103,9 +103,9 @@ export TRANSFORMERS_OFFLINE=1
 
 ## 5. Post-Install Verification (Offline vs. Model-Dependent Tests)
 
-The test suite contains 19 test modules collecting 206 total test cases. Tests are categorized into two tiers based on external model dependencies:
+The test suite contains 19 test modules collecting 240 total test cases. Tests are categorized into two tiers based on external model dependencies:
 
-### Tier 1: Verified Offline Test Suite (16 Modules, 195 Tests)
+### Tier 1: Verified Offline Test Suite (16 Modules, 229 Tests)
 These 16 test modules execute purely on synthetic tensors, mathematical mocks, or simulated GPU state, requiring **zero internet connectivity and no downloaded model weights**:
 
 ```bash

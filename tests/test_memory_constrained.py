@@ -70,14 +70,16 @@ def create_test_model(
 
     def forward_impl(input_tensor: Any, past_key_values: Any = None, use_cache: bool = True, **kwargs: Any) -> Any:
         num_tokens = input_tensor.shape[1]
+        prev_len = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+        total_len = prev_len + num_tokens
         logits = torch.zeros((1, num_tokens, vocab_size))
         # Non-eos token by default so generation proceeds
         logits[0, -1, 10] = 10.0
         # Standard HuggingFace tuple format: tuple of (k, v) where shape is [1, num_kv_heads, seq_len, head_dim]
         cache = tuple(
             (
-                torch.zeros((1, num_kv_heads, num_tokens, head_dim)),
-                torch.zeros((1, num_kv_heads, num_tokens, head_dim)),
+                torch.zeros((1, num_kv_heads, total_len, head_dim)),
+                torch.zeros((1, num_kv_heads, total_len, head_dim)),
             )
             for _ in range(num_layers)
         )
@@ -95,6 +97,8 @@ def make_test_engine(
     prefix: bool = False,
     model: Any = None,
     tokenizer: Any = None,
+    chunked_prefill: bool = False,
+    prefill_chunk_size: int = 32,
 ) -> MiniVLLMEngine:
     engine = MiniVLLMEngine(
         model=model or create_test_model(),
@@ -104,7 +108,8 @@ def make_test_engine(
         max_batch_size=max_batch_size,
         device="cpu",
         enable_prefix_caching=prefix,
-        chunked_prefill=False,
+        chunked_prefill=chunked_prefill,
+        prefill_chunk_size=prefill_chunk_size,
     )
 
     # Attach default deterministic batched_decode_step mock on runner

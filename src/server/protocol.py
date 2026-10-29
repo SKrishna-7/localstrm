@@ -41,6 +41,10 @@ class ChatMessage(BaseModel):
     name: Optional[str] = None
 
 
+class StreamOptions(BaseModel):
+    include_usage: Optional[bool] = False
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage] = Field(..., min_length=1, description="A list of messages comprising the conversation so far.")
@@ -50,6 +54,7 @@ class ChatCompletionRequest(BaseModel):
     min_p: Optional[float] = Field(default=0.0, ge=0.0, le=1.0)
     max_tokens: Optional[int] = Field(default=256, gt=0)
     stream: Optional[bool] = False
+    stream_options: Optional[StreamOptions] = None
     stop: Optional[Union[str, List[str]]] = None
     repetition_penalty: Optional[float] = Field(default=1.0, gt=0.0)
     frequency_penalty: Optional[float] = Field(default=0.0, ge=-2.0, le=2.0)
@@ -97,7 +102,8 @@ class ChatCompletionChunk(BaseModel):
     object: str = "chat.completion.chunk"
     created: int
     model: str
-    choices: List[ChatCompletionChunkChoice]
+    choices: List[ChatCompletionChunkChoice] = Field(default_factory=list)
+    usage: Optional[UsageInfo] = None
 
 
 # =========================================================================
@@ -110,6 +116,7 @@ class CompletionRequest(BaseModel):
     temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=1.0, ge=0.0, le=1.0)
     stream: Optional[bool] = False
+    stream_options: Optional[StreamOptions] = None
     stop: Optional[Union[str, List[str]]] = None
     repetition_penalty: Optional[float] = Field(default=1.0, gt=0.0)
 
@@ -134,6 +141,21 @@ class CompletionResponseChoice(BaseModel):
     index: int = 0
     text: str
     finish_reason: Optional[str] = "stop"
+
+
+class CompletionResponseStreamChoice(BaseModel):
+    index: int = 0
+    text: str
+    finish_reason: Optional[str] = None
+
+
+class CompletionChunk(BaseModel):
+    id: str
+    object: str = "text_completion"
+    created: int
+    model: str
+    choices: List[CompletionResponseStreamChoice] = Field(default_factory=list)
+    usage: Optional[UsageInfo] = None
 
 
 class CompletionResponse(BaseModel):

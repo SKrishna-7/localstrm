@@ -94,6 +94,35 @@ class OutputChunk:
     finish_reason: Optional[str] = None
     token_id: Optional[int] = None
     error: Optional[Exception] = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+class StreamChunk(tuple):
+    """
+    OpenAI-compatible streaming chunk tuple subclass.
+    Unpacks as (text, is_first, is_last, finish_reason) while exposing
+    rich attributes: prompt_tokens, completion_tokens, token_id.
+    """
+    def __new__(
+        cls,
+        text: str,
+        is_first: bool,
+        is_last: bool,
+        finish_reason: Optional[str],
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        token_id: Optional[int] = None
+    ):
+        obj = super().__new__(cls, (text, is_first, is_last, finish_reason))
+        obj.text = text
+        obj.is_first = is_first
+        obj.is_last = is_last
+        obj.finish_reason = finish_reason
+        obj.prompt_tokens = prompt_tokens
+        obj.completion_tokens = completion_tokens
+        obj.token_id = token_id
+        return obj
 
 
 @dataclass
@@ -265,7 +294,15 @@ class AsyncServingAdapter:
                 chunk = await output_queue.get()
                 if chunk.error is not None:
                     raise chunk.error
-                yield (chunk.text, chunk.is_first, chunk.is_last, chunk.finish_reason)
+                yield StreamChunk(
+                    chunk.text,
+                    chunk.is_first,
+                    chunk.is_last,
+                    chunk.finish_reason,
+                    prompt_tokens=chunk.prompt_tokens,
+                    completion_tokens=chunk.completion_tokens,
+                    token_id=chunk.token_id
+                )
                 if chunk.is_last:
                     break
         except (GeneratorExit, asyncio.CancelledError):
@@ -290,14 +327,19 @@ class AsyncServingAdapter:
         full_chunks = []
         finish_reason: Optional[str] = None
         prompt_len = len(self.tokenizer.encode(prompt)) if self.tokenizer is not None else 0
+        gen_tokens = 0
 
-        async for chunk_text, _, is_last, f_reason in self.generate_stream(prompt, sampling_params, max_tokens):
+        async for chunk in self.generate_stream(prompt, sampling_params, max_tokens):
+            chunk_text, _, is_last, f_reason = chunk
             full_chunks.append(chunk_text)
+            if hasattr(chunk, "completion_tokens"):
+                gen_tokens = chunk.completion_tokens
+            if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens > 0:
+                prompt_len = chunk.prompt_tokens
             if is_last:
                 finish_reason = f_reason
 
         full_text = "".join(full_chunks)
-        gen_tokens = len(self.tokenizer.encode(full_text)) if self.tokenizer is not None else 0
         return full_text, prompt_len, gen_tokens, finish_reason
 
     def shutdown_sync(self, timeout: float = 5.0) -> None:
@@ -501,6 +543,7 @@ class AsyncServingAdapter:
 
                     total_tokens = len(req.output_token_ids)
                     is_terminal = req.status in (RequestStatus.FINISHED, RequestStatus.FAILED)
+                    p_len = len(req.prompt_token_ids) if hasattr(req, "prompt_token_ids") else (len(self.tokenizer.encode(req.prompt)) if (self.tokenizer and hasattr(req, "prompt")) else 0)
 
                     if total_tokens > tracker.seen_tokens:
                         new_ids = req.output_token_ids[tracker.seen_tokens:total_tokens]
@@ -517,7 +560,9 @@ class AsyncServingAdapter:
                                 is_first=is_first,
                                 is_last=is_last_token,
                                 finish_reason=finish_reason,
-                                token_id=tok_id
+                                token_id=tok_id,
+                                prompt_tokens=p_len,
+                                completion_tokens=tracker.seen_tokens + idx + 1
                             )
                             if is_last_token:
                                 tracker.is_last_emitted = True
@@ -545,7 +590,9 @@ class AsyncServingAdapter:
                                     is_first=not tracker.is_first_emitted,
                                     is_last=True,
                                     finish_reason=map_engine_stop_reason_to_finish_reason(req.stop_reason),
-                                    error=err
+                                    error=err,
+                                    prompt_tokens=p_len,
+                                    completion_tokens=total_tokens
                                 )
                             )
                         elif total_tokens == 0:
@@ -557,7 +604,9 @@ class AsyncServingAdapter:
                                 OutputChunk(
                                     is_first=not tracker.is_first_emitted,
                                     is_last=True,
-                                    finish_reason=map_engine_stop_reason_to_finish_reason(req.stop_reason)
+                                    finish_reason=map_engine_stop_reason_to_finish_reason(req.stop_reason),
+                                    prompt_tokens=p_len,
+                                    completion_tokens=0
                                 )
                             )
                         elif not tracker.is_last_emitted:
@@ -569,7 +618,9 @@ class AsyncServingAdapter:
                                 OutputChunk(
                                     is_first=not tracker.is_first_emitted,
                                     is_last=True,
-                                    finish_reason=map_engine_stop_reason_to_finish_reason(req.stop_reason)
+                                    finish_reason=map_engine_stop_reason_to_finish_reason(req.stop_reason),
+                                    prompt_tokens=p_len,
+                                    completion_tokens=total_tokens
                                 )
                             )
 

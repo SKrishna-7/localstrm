@@ -4,7 +4,7 @@
 
 [![Python: 3.11](https://img.shields.io/badge/Python-3.11-green.svg)](INSTALL.md)
 [![PyTorch: 2.1+](https://img.shields.io/badge/PyTorch-2.1%2B-orange.svg)](https://pytorch.org/)
-[![Test Suite: 206 Tests](https://img.shields.io/badge/Test%20Suite-206%20Tests-brightgreen.svg)](tests/)
+[![Test Suite: 240 Tests](https://img.shields.io/badge/Test%20Suite-240%20Tests-brightgreen.svg)](tests/)
 
 ---
 
@@ -26,7 +26,7 @@
 LocalStrm breaks LLM inference into the systems that make text generation possible: model loading, KV-cache memory management, request scheduling, token generation, and serving.
 Instead of treating inference as a single `generate()` call, LocalStrm implements these components as separate, inspectable parts of a PyTorch inference engine. The goal is to make memory management and concurrent request scheduling easier to study in a smaller codebase.
 
-> **Note:** The engine class name `MiniVLLMEngine` and the CLI flag `--engine mini-vllm` are legacy internal identifiers retained for backward compatibility with existing tests and scripts.
+> **Note:** The engine class name `MiniVLLMEngine` and the legacy CLI flag `--engine mini-vllm` are internal identifiers retained for backward compatibility with existing tests and scripts. The canonical user-facing engine selector is `--engine localstrm`.
 
 ---
 ## Installation & Quick Start
@@ -189,10 +189,14 @@ The first run may download model files if they are not already cached locally.
 For quick interactive experimentation in the terminal:
 
 ```bash
-python cli.py chat --model Qwen/Qwen2.5-0.5B
+# Run with LocalStrm native PagedAttention engine:
+python cli.py chat --engine localstrm --model Qwen/Qwen2.5-Coder-0.5B-Instruct
+
+# Or run with the Hugging Face serial backend (default):
+python cli.py chat --engine hf --model Qwen/Qwen2.5-0.5B
 ```
 
-**Note:** The `chat` command uses the Hugging Face generation pipeline. To explore LocalStrm's own inference-engine implementation, use the `engine` command.
+**Note:** The `chat` command supports both `--engine localstrm` (LocalStrm's native PagedAttention engine; legacy alias: `--engine mini-vllm`) and `--engine hf` (Hugging Face serial engine, default).
 
 ### 10. Start the HTTP API (Optional)
 
@@ -200,7 +204,7 @@ Install the serving dependencies, then start the LocalStrm serving backend:
 
 ```bash
 python cli.py serve \
-  --engine mini-vllm \
+  --engine localstrm \
   --model Qwen/Qwen2.5-0.5B \
   --host 127.0.0.1 \
   --port 8000
@@ -217,7 +221,7 @@ Available endpoints include:
 - `GET /metrics` - Prometheus metrics.
 - `GET /docs` - Interactive API documentation.
 
-The `mini-vllm` backend uses LocalStrm's inference engine. The default `hf` backend uses Hugging Face serving instead.
+The `localstrm` backend uses LocalStrm's native inference engine (`--engine mini-vllm` is supported as a legacy backwards-compatible alias). The default `hf` backend uses Hugging Face serving instead.
 
 ### 11. Platform Notes
 
@@ -331,7 +335,7 @@ LocalStrm separates the work of inference into request handling, scheduling, KV-
 
 ### End-to-End Request Lifecycle
 
-1. **Request entry:** `cli.py engine` submits prompts to `MiniVLLMEngine`. The separate `cli.py chat` command is a Hugging Face interactive REPL. For HTTP requests, the server backend depends on `--engine`: the default `hf` backend uses Hugging Face serving, while `--engine mini-vllm` selects LocalStrm's engine and serving adapter.
+1. **Request entry:** `cli.py engine` submits prompts to `MiniVLLMEngine`. `cli.py chat` supports both `--engine localstrm` (native PagedAttention engine) and `--engine hf` (default Hugging Face serial engine). For HTTP requests, the server backend depends on `--engine`: the default `hf` backend uses Hugging Face serving, while `--engine localstrm` (legacy alias: `--engine mini-vllm`) selects LocalStrm's engine and serving adapter.
 2. **Tokenization and registration:** The ingress layer formats chat messages when applicable, tokenizes the prompt, and creates an `EngineRequest` with its sampling settings. New requests enter the waiting queue until the scheduler can admit them.
 3. **Scheduling and prefix reuse:** The scheduler considers available KV-cache blocks, request length limits, and memory pressure. When prefix caching is enabled, matching 16-token blocks can be reused through chained SHA-256 hashes. A request that cannot fit in the pool fails rather than remaining queued indefinitely.
 4. **Prompt prefill:** The engine processes prompt tokens to populate the KV cache. Optional chunked prefill divides longer prompts into smaller pieces so prefill work can be interleaved with decode work.
@@ -434,18 +438,22 @@ python cli.py chat [flags...]
 
 | Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
+| `--engine {hf,localstrm,mini-vllm}` | String | `hf` | Chat engine backend: `localstrm` (LocalStrm PagedAttention continuous batching engine; legacy alias: `mini-vllm`) or `hf` (default: Hugging Face serial engine). |
 | `--quant {none,int8,int4,hybrid_int8}` | String | `none` | Weight quantization precision applied to the chat model. |
 | `--max-tokens INT` | Integer | `128` | Maximum new tokens generated per conversational turn. |
 | `--temperature FLOAT` | Float | `0.7` | Sampling temperature for creative conversational variety (`0.0` for greedy). |
 | `--system STR` | String | `None` | Custom system prompt overriding the model's default conversation persona. |
+| `--batch-size INT` | Integer | `4` | Maximum continuous batch capacity for LocalStrm engine. |
+| `--total-blocks INT` | Integer | `None` | Total physical KV cache blocks for LocalStrm engine. |
+| `--vram-budget STR` | String | `None` | Total engine VRAM operational budget ceiling for LocalStrm engine. |
+| `--kv-cache-dtype {fp16,int8}` | String | `fp16` | KV cache storage dtype for LocalStrm engine (default: fp16, int8 cuts KV memory by 50%). |
 
 > [!NOTE]
-
-> **Architectural Distinction: `engine` vs. `chat`**<br>
-
-> - `cli.py engine` executes LocalStrm's core `MiniVLLMEngine` architecture, utilizing non-contiguous PagedAttention memory management, continuous request scheduling, chunked prefill, and chained block-hash prefix caching.
-
-> - `cli.py chat` is a lightweight interactive REPL powered by Hugging Face's standard generation pipeline (`model.generate(..., use_cache=True)` with `TextIteratorStreamer`). It is intended for quick manual prompt testing and conversational exploration.
+> **Execution Backends: `localstrm` vs. `hf`**<br>
+>
+> - `cli.py chat --engine localstrm` executes LocalStrm's core `MiniVLLMEngine` architecture in an interactive terminal session, streaming responses token-by-token with non-contiguous PagedAttention memory management, prefix caching, and live TTFT/TPOT latency metrics.
+>
+> - `cli.py chat --engine hf` (default) provides a serial REPL powered by Hugging Face's sequential decode pipeline.
 
 ### 4. Hardware & Memory Preflight
 
@@ -490,7 +498,7 @@ python cli.py models
 Launches an OpenAI-compatible REST API server powered by FastAPI and Uvicorn.
 
 ```bash
-python cli.py serve --engine mini-vllm --model Qwen/Qwen2.5-0.5B --host 127.0.0.1 --port 8000
+python cli.py serve --engine localstrm --model Qwen/Qwen2.5-0.5B --host 127.0.0.1 --port 8000
 ```
 
 | Flag | Type | Default | Description |
@@ -498,17 +506,17 @@ python cli.py serve --engine mini-vllm --model Qwen/Qwen2.5-0.5B --host 127.0.0.
 | `--host STR` | String | `127.0.0.1` | Network interface address to bind the HTTP server. The server provides no built-in authentication; binding to 0.0.0.0 exposes the API to the local network or internet. |
 | `--port INT` | Integer | `8000` | TCP port to listen for incoming HTTP connections. |
 | `--quant {none,int8,int4,hybrid_int8}` | String | `none` | Optional model weight quantization. |
-| `--engine {hf,mini-vllm}` | String | `hf` | Serving backend engine. Choose `mini-vllm` for true continuous batching or `hf` for sequential Hugging Face serving. |
-| `--batch-size INT` | Integer | `4` | Maximum continuous batch capacity. **Applies strictly to `--engine mini-vllm`.** |
-| `--total-blocks INT` | Integer | `None` | Explicit physical KV cache block count. Mutually exclusive with `--vram-budget`. **Applies strictly to `--engine mini-vllm`.** |
-| `--vram-budget STR` | String | `None` | Total VRAM operational budget ceiling (e.g., `2GiB`, `1400MiB`). Mutually exclusive with `--total-blocks`. **Applies strictly to `--engine mini-vllm`.** |
-| `--kv-cache-dtype {fp16,int8}` | String | `fp16` | KV cache storage datatype (`fp16` or `int8`). **Applies strictly to `--engine mini-vllm`.** |
+| `--engine {hf,localstrm,mini-vllm}` | String | `hf` | Serving backend engine. Choose `localstrm` (canonical; legacy alias: `mini-vllm`) for true continuous batching or `hf` for sequential Hugging Face serving. |
+| `--batch-size INT` | Integer | `4` | Maximum continuous batch capacity. **Applies strictly to `--engine localstrm` (or legacy `mini-vllm`).** |
+| `--total-blocks INT` | Integer | `None` | Explicit physical KV cache block count. Mutually exclusive with `--vram-budget`. **Applies strictly to `--engine localstrm`.** |
+| `--vram-budget STR` | String | `None` | Total VRAM operational budget ceiling (e.g., `2GiB`, `1400MiB`). Mutually exclusive with `--total-blocks`. **Applies strictly to `--engine localstrm`.** |
+| `--kv-cache-dtype {fp16,int8}` | String | `fp16` | KV cache storage datatype (`fp16` or `int8`). **Applies strictly to `--engine localstrm`.** |
 
 > [!WARNING]
 
 > **Engine Backend Compatibility in `serve`:**<br>
 
-> When running `--engine hf` (the default), requests are served sequentially via Hugging Face pipelines. Options `--total-blocks`, `--vram-budget`, and `--kv-cache-dtype` belong strictly to LocalStrm's PagedAttention engine; specifying them under `--engine hf` produces a warning and they are ignored. To use LocalStrm continuous batching, pass `--engine mini-vllm`.
+> When running `--engine hf` (the default), requests are served sequentially via Hugging Face pipelines. Options `--total-blocks`, `--vram-budget`, and `--kv-cache-dtype` belong strictly to LocalStrm's PagedAttention engine; specifying them under `--engine hf` produces a warning and they are ignored. To use LocalStrm continuous batching, pass `--engine localstrm` (or legacy alias `--engine mini-vllm`).
 
 #### Served Endpoints
 
@@ -627,7 +635,7 @@ Launch the HTTP server backed by the LocalStrm continuous batching engine:
 
 ```bash
 python cli.py serve \
-  --engine mini-vllm \
+  --engine localstrm \
   --model Qwen/Qwen2.5-0.5B \
   --host 127.0.0.1 \
   --port 8000 \
@@ -678,7 +686,7 @@ python cli.py prefix-cache \
 ```
 
 - **Serving Engine Backend Constraints:**
-  Options `--total-blocks`, `--vram-budget`, and `--kv-cache-dtype` configure LocalStrm's PagedAttention allocator. If passed to `cli.py serve` when `--engine hf` is selected, they will be ignored with a warning. Use `--engine mini-vllm` to activate these controls.
+  Options `--total-blocks`, `--vram-budget`, and `--kv-cache-dtype` configure LocalStrm's PagedAttention allocator. If passed to `cli.py serve` when `--engine hf` is selected, they will be ignored with a warning. Use `--engine localstrm` to activate these controls.
 - **Quantization Hardware Requirements:**
   - `none`: FP16/BF16 weights and compute. Works on all CUDA and CPU devices.
   - `int8` (W8A16) and `int4` (W4A16): Supported across all CUDA architectures.
@@ -835,8 +843,8 @@ We compared dynamic INT8 execution with LocalStrm's Hybrid INT8 execution using 
 ### Test Suite
 
 The repository includes an automated regression test suite covering the core engine and serving subsystems:
-- **206 tests collected across 19 test modules** (`pytest tests/ --collect-only -q`).
-- Test execution is split between **16 offline test modules** (executable without internet access or model downloads, 195 tests) and **3 model-dependent modules** (requiring local cached weights of `Qwen/Qwen2.5-0.5B`, 11 tests). See [`INSTALL.md`](INSTALL.md) for execution details. All **195 offline tests passed**; all **11 model-dependent integration tests passed** when cached weights are present (206/206 total passing).
+- **240 tests collected across 19 test modules** (`pytest tests/ --collect-only -q`).
+- Test execution is split between **16 offline test modules** (executable without internet access or model downloads, 229 tests) and **3 model-dependent modules** (requiring local cached weights of `Qwen/Qwen2.5-0.5B`, 11 tests). See [`INSTALL.md`](INSTALL.md) for execution details. All **229 offline tests passed**; all **11 model-dependent integration tests passed** when cached weights are present (240/240 total passing).
 - Tests validate: physical block allocation, block recycling, prefix cache chained block hashing, victim preemption under memory starvation, greedy sampling reproducibility, GQA dimensions, CPU-staged quantization loading, `torch._int_mm` fallbacks, preflight fail-closed guards, live HTTP FastAPI lifecycle events, multi-token stopping criteria vocabulary verification, INT4 slice dequantization numerical equivalence, and fail-closed architecture guards.
 
 ### Supported Model Architectures
@@ -845,7 +853,7 @@ The repository includes an automated regression test suite covering the core eng
   - **Fully Supported & Verified:** `Qwen/Qwen2.5-0.5B` (Linux x86_64 CUDA, FP16 and INT8 KV-cache, continuous batching, prefix caching, multi-step generation, and HTTP serving verified across 11 integration tests and 90 benchmark runs).
   - **Smoke-Tested:** `Qwen/Qwen2.5-Coder-1.5B-Instruct` (Linux x86_64 CUDA, INT4 weight quantization via `cli.py chat` with multi-turn conversation and verified stop-token termination).
   - **Architecture Target (Not Universally Verified):** Structural compatibility targets LLaMA / Qwen2 / Mistral decoder-only families; however, individual checkpoints, alternative precision formats, and unverified backends must be tested individually and are not guaranteed to work without dedicated validation.
-- **Incompatible with `--engine mini-vllm`:**
+- **Incompatible with `--engine localstrm`:**
   - **Tri-hybrid architectures:** Models combining gated short convolutions, sliding-window attention, and global attention (such as LiquidAI LFM3 / `liquid_lfm`) do not use standard transformer attention blocks and fail closed with a clear diagnostic error.
   - **Other non-standard architectures:** Encoder-decoder models (T5), non-standard attention models (Bloom, Falcon, GPT-2), and mixture-of-experts architectures without dense projections. For non-supported models or custom architectures, use `--engine hf`.
 

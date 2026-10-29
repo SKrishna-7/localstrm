@@ -24,6 +24,7 @@ from src.engine.sampling import (
     check_stop_criteria
 )
 from src.observability.metrics import EngineMetricsTracker
+from src.server.serving_adapter import StreamChunk
 
 logger = get_logger("mini_vllm.server_engine")
 
@@ -109,9 +110,11 @@ class AsyncServingEngine:
         """
         async with self._lock:
             self.metrics.num_requests_running += 1
+            self.metrics.record_queue_state(self.metrics.num_requests_running, 0)
             completed_normally = False
             t_prefill_start = time.perf_counter()
             prompt_len = 0
+            prefill_done = False
             generated_ids = []
             try:
                 # Tokenize prompt
@@ -120,6 +123,9 @@ class AsyncServingEngine:
 
                 with torch.no_grad():
                     outputs = self.model(input_ids, use_cache=True)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                prefill_done = True
                 t_prefill_end = time.perf_counter()
 
                 ttft_ms = (t_prefill_end - t_prefill_start) * 1000.0
@@ -133,11 +139,27 @@ class AsyncServingEngine:
 
                 if next_token == self.tokenizer.eos_token_id or max_tokens <= 1:
                     finish_reason = "stop" if next_token == self.tokenizer.eos_token_id else "length"
-                    yield (first_text, True, True, finish_reason)
+                    yield StreamChunk(
+                        first_text,
+                        True,
+                        True,
+                        finish_reason,
+                        prompt_tokens=prompt_len,
+                        completion_tokens=len(generated_ids),
+                        token_id=next_token
+                    )
                     completed_normally = True
                     return
 
-                yield (first_text, True, False, None)
+                yield StreamChunk(
+                    first_text,
+                    True,
+                    False,
+                    None,
+                    prompt_tokens=prompt_len,
+                    completion_tokens=len(generated_ids),
+                    token_id=next_token
+                )
 
                 # Let other event loop tasks breathe
                 await asyncio.sleep(0)
@@ -149,6 +171,8 @@ class AsyncServingEngine:
                     t_decode_start = time.perf_counter()
                     with torch.no_grad():
                         outputs = self.model(curr_token, past_key_values=past_key_values, use_cache=True)
+                    if self.device.type == "cuda":
+                        torch.cuda.synchronize(self.device)
                     t_decode_end = time.perf_counter()
 
                     tpot_ms = (t_decode_end - t_decode_start) * 1000.0
@@ -174,32 +198,72 @@ class AsyncServingEngine:
 
                     if should_stop or next_token == self.tokenizer.eos_token_id:
                         finish_reason = "stop"
-                        yield (token_text, False, True, finish_reason)
+                        yield StreamChunk(
+                            token_text,
+                            False,
+                            True,
+                            finish_reason,
+                            prompt_tokens=prompt_len,
+                            completion_tokens=len(generated_ids),
+                            token_id=next_token
+                        )
                         completed_normally = True
                         break
                     elif step == max_tokens - 1:
                         finish_reason = "length"
-                        yield (token_text, False, True, finish_reason)
+                        yield StreamChunk(
+                            token_text,
+                            False,
+                            True,
+                            finish_reason,
+                            prompt_tokens=prompt_len,
+                            completion_tokens=len(generated_ids),
+                            token_id=next_token
+                        )
                         completed_normally = True
                         break
                     else:
-                        yield (token_text, False, False, None)
+                        yield StreamChunk(
+                            token_text,
+                            False,
+                            False,
+                            None,
+                            prompt_tokens=prompt_len,
+                            completion_tokens=len(generated_ids),
+                            token_id=next_token
+                        )
 
                     curr_token = torch.tensor([[next_token]], device=self.device)
                     await asyncio.sleep(0)
             except (GeneratorExit, asyncio.CancelledError):
                 logger.info("generate_stream cancelled or client disconnected")
+                self.metrics.record_request_failed(
+                    error_type="abort",
+                    prompt_tokens=prompt_len if prefill_done else 0,
+                    generated_tokens=len(generated_ids)
+                )
                 raise
             except (torch.cuda.OutOfMemoryError, getattr(torch, "OutOfMemoryError", ())) as e:
                 logger.error("CUDA OOM during generate_stream: %s", e)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                self.metrics.record_request_failed(
+                    error_type="cuda_oom",
+                    prompt_tokens=prompt_len if prefill_done else 0,
+                    generated_tokens=len(generated_ids)
+                )
                 raise
             except Exception as e:
                 logger.error("Error during generate_stream: %s", e)
+                self.metrics.record_request_failed(
+                    error_type="error",
+                    prompt_tokens=prompt_len if prefill_done else 0,
+                    generated_tokens=len(generated_ids)
+                )
                 raise
             finally:
                 self.metrics.num_requests_running = max(0, self.metrics.num_requests_running - 1)
+                self.metrics.record_queue_state(self.metrics.num_requests_running, 0)
                 if completed_normally:
                     self.metrics.record_request_completed(
                         prompt_tokens=prompt_len,
@@ -220,12 +284,17 @@ class AsyncServingEngine:
         full_chunks = []
         finish_reason = "stop"
         prompt_len = len(self.tokenizer.encode(prompt))
+        gen_tokens = 0
 
-        async for chunk_text, _, is_last, f_reason in self.generate_stream(prompt, sampling_params, max_tokens):
+        async for chunk in self.generate_stream(prompt, sampling_params, max_tokens):
+            chunk_text, _, is_last, f_reason = chunk
             full_chunks.append(chunk_text)
+            if hasattr(chunk, "completion_tokens"):
+                gen_tokens = chunk.completion_tokens
+            if hasattr(chunk, "prompt_tokens") and chunk.prompt_tokens > 0:
+                prompt_len = chunk.prompt_tokens
             if is_last and f_reason:
                 finish_reason = f_reason
 
         full_text = "".join(full_chunks)
-        gen_tokens = len(self.tokenizer.encode(full_text))
         return full_text, prompt_len, gen_tokens, finish_reason
