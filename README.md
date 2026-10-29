@@ -841,8 +841,13 @@ The repository includes an automated regression test suite covering the core eng
 
 ### Supported Model Architectures
 
-- **Architecture pattern:** Decoder-only transformer architectures following the standard LLaMA / Qwen2 / Mistral design (`model.layers[i]`, RMSNorm, RoPE, and Grouped Query Attention). End-to-end GPU validation in the recorded tests uses `Qwen/Qwen2.5-0.5B` and `Qwen/Qwen2.5-Coder-1.5B-Instruct`; other structurally compatible decoder-only transformers should be validated individually.
-- **Incompatible with `--engine mini-vllm`:** Hybrid convolution / State-Space Models (SSM) such as LiquidAI LFM3 (`liquid_lfm`), encoder-decoder models (T5), non-standard attention models (Bloom, Falcon, GPT-2), and mixture-of-experts architectures without dense projections. For non-supported models or custom architectures, use `--engine hf`.
+- **Architecture pattern:** Standard decoder-only transformer architectures with dense linear projections (`model.layers[i]`, RMSNorm, RoPE, and Grouped Query Attention).
+  - **Fully Supported & Verified:** `Qwen/Qwen2.5-0.5B` (Linux x86_64 CUDA, FP16 and INT8 KV-cache, continuous batching, prefix caching, multi-step generation, and HTTP serving verified across 11 integration tests and 90 benchmark runs).
+  - **Smoke-Tested:** `Qwen/Qwen2.5-Coder-1.5B-Instruct` (Linux x86_64 CUDA, INT4 weight quantization via `cli.py chat` with multi-turn conversation and verified stop-token termination).
+  - **Architecture Target (Not Universally Verified):** Structural compatibility targets LLaMA / Qwen2 / Mistral decoder-only families; however, individual checkpoints, alternative precision formats, and unverified backends must be tested individually and are not guaranteed to work without dedicated validation.
+- **Incompatible with `--engine mini-vllm`:**
+  - **Tri-hybrid architectures:** Models combining gated short convolutions, sliding-window attention, and global attention (such as LiquidAI LFM3 / `liquid_lfm`) do not use standard transformer attention blocks and fail closed with a clear diagnostic error.
+  - **Other non-standard architectures:** Encoder-decoder models (T5), non-standard attention models (Bloom, Falcon, GPT-2), and mixture-of-experts architectures without dense projections. For non-supported models or custom architectures, use `--engine hf`.
 
 ### Known Limitations
 
