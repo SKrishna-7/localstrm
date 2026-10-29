@@ -27,14 +27,14 @@ class ModelConfig:
     """Configuration for model architecture and weights."""
     model_name_or_path: str = field(default_factory=get_default_model)
     dtype: torch.dtype = torch.float16
-    trust_remote_code: bool = True
+    trust_remote_code: bool = False
     max_model_len: Optional[int] = None
 
     @classmethod
-    def from_str(cls, model_str: Optional[str] = None, device: str = "cpu") -> "ModelConfig":
+    def from_str(cls, model_str: Optional[str] = None, device: str = "cpu", trust_remote_code: bool = False) -> "ModelConfig":
         model_name = model_str or get_default_model()
         dtype = torch.float32 if device == "cpu" else torch.float16
-        return cls(model_name_or_path=model_name, dtype=dtype)
+        return cls(model_name_or_path=model_name, dtype=dtype, trust_remote_code=trust_remote_code)
 
 
 @dataclass
@@ -101,7 +101,7 @@ class EngineConfig:
             from src.memory.preflight import parse_vram_budget_bytes
             vram_budget_bytes = parse_vram_budget_bytes(vram_budget)
 
-        model_cfg = ModelConfig.from_str(model_name, device=device)
+        model_cfg = ModelConfig.from_str(model_name, device=device, trust_remote_code=trust_remote_code)
         cache_cfg = CacheConfig(
             block_size=block_size,
             total_blocks=total_blocks,

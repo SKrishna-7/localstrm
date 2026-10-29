@@ -359,7 +359,7 @@ class MiniVLLMEngine:
                 vram_budget_bytes = parse_vram_budget_bytes(vram_budget)
 
             self.config = EngineConfig(
-                model=ModelConfig.from_str(resolved_model, device=resolved_device),
+                model=ModelConfig.from_str(resolved_model, device=resolved_device, trust_remote_code=trust_remote_code),
                 cache=CacheConfig(
                     block_size=block_size,
                     total_blocks=total_blocks,
@@ -381,6 +381,8 @@ class MiniVLLMEngine:
             self.config = config
             if trust_remote_code:
                 self.config.trust_remote_code = True
+                if hasattr(self.config, "model") and hasattr(self.config.model, "trust_remote_code"):
+                    self.config.model.trust_remote_code = True
             if batched_decode is not None:
                 self.config.scheduler.batched_decode = batched_decode
             if total_blocks is not None and self.config.cache.vram_budget_bytes is not None:

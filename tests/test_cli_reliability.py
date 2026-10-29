@@ -132,8 +132,11 @@ def test_cli_all_successful_requests_exit_0(capsys):
 
 
 def test_cli_trust_remote_code_flag_parsing():
-    """Verify that --trust-remote-code is parsed and defaults to False."""
+    """Verify that --trust-remote-code is parsed and defaults to False across configs and CLI."""
     from cli import build_parser
+    from src.config import EngineConfig, ModelConfig
+
+    assert ModelConfig().trust_remote_code is False
 
     parser = build_parser()
     for subcmd in ("chat", "serve", "engine", "benchmark", "inspect"):
@@ -142,6 +145,14 @@ def test_cli_trust_remote_code_flag_parsing():
 
         args_enabled = parser.parse_args([subcmd, "--trust-remote-code"])
         assert args_enabled.trust_remote_code is True
+
+    cfg_default = EngineConfig.from_args(parser.parse_args(["engine"]))
+    assert cfg_default.trust_remote_code is False
+    assert cfg_default.model.trust_remote_code is False
+
+    cfg_enabled = EngineConfig.from_args(parser.parse_args(["engine", "--trust-remote-code"]))
+    assert cfg_enabled.trust_remote_code is True
+    assert cfg_enabled.model.trust_remote_code is True
 
 
 def test_cmd_chat_stopping_on_im_end(capsys):
@@ -253,3 +264,50 @@ def test_cmd_chat_prefill_immediate_eos(capsys):
 
     # Ensure model was only called once for prefill
     assert mock_model.call_count == 1
+
+
+def test_stopping_criteria_does_not_alias_unk_or_pad():
+    """
+    Regression test: Verify that candidate end tokens (<|im_end|>, <|eot_id|>) cannot
+    accidentally alias unk_token_id, pad_token_id, or unmapped token IDs in other models (e.g. BERT/GPT-2).
+    """
+    from cli import get_stopping_criteria_token_ids
+
+    # Case 1: Model with unk_token_id=100 where unsupported token maps to 100
+    mock_tok_bert = MagicMock()
+    mock_tok_bert.eos_token_id = 102
+    mock_tok_bert.unk_token_id = 100
+    mock_tok_bert.pad_token_id = 0
+    mock_tok_bert.get_vocab.return_value = {"[CLS]": 101, "[SEP]": 102, "[UNK]": 100, "[PAD]": 0}
+    mock_tok_bert.convert_tokens_to_ids.side_effect = lambda tok: 100
+
+    stops = get_stopping_criteria_token_ids(mock_tok_bert)
+    assert 100 not in stops, "unk_token_id was incorrectly added as a stop token!"
+    assert 0 not in stops, "pad_token_id was incorrectly added as a stop token!"
+    assert stops == {102}
+
+    # Case 2: Tokenizer without get_vocab where convert_tokens_to_ids returns 99, but decode returns '<unk>'
+    mock_tok_legacy = MagicMock(spec=["eos_token_id", "unk_token_id", "pad_token_id", "convert_tokens_to_ids", "decode"])
+    mock_tok_legacy.eos_token_id = 50256
+    mock_tok_legacy.unk_token_id = None
+    mock_tok_legacy.pad_token_id = None
+    mock_tok_legacy.convert_tokens_to_ids.return_value = 99
+    mock_tok_legacy.decode.return_value = "<unk>"
+
+    stops_legacy = get_stopping_criteria_token_ids(mock_tok_legacy)
+    assert 99 not in stops_legacy, "Unmapped token ID was incorrectly added without vocabulary verification!"
+    assert stops_legacy == {50256}
+
+    # Case 3: Legitimate Qwen2.5 model supporting <|im_end|> and list eos_token_id
+    mock_tok_qwen = MagicMock()
+    mock_tok_qwen.eos_token_id = 151643
+    mock_tok_qwen.unk_token_id = None
+    mock_tok_qwen.pad_token_id = None
+    mock_tok_qwen.get_vocab.return_value = {"<|endoftext|>": 151643, "<|im_end|>": 151645}
+
+    mock_model_qwen = MagicMock()
+    mock_model_qwen.generation_config.eos_token_id = [151645, 151643]
+
+    stops_qwen = get_stopping_criteria_token_ids(mock_tok_qwen, mock_model_qwen)
+    assert stops_qwen == {151643, 151645}
+

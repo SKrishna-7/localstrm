@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore")
 
 import argparse
 import time
-from typing import List, Optional
+from typing import List, Optional, Set, Any
 
 # Add project root to sys.path so src imports resolve cleanly
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
@@ -584,6 +584,50 @@ def cmd_serve(args):
 
 
 
+def get_stopping_criteria_token_ids(tokenizer: Any, model: Optional[Any] = None) -> Set[int]:
+    """
+    Extracts all valid end-of-sequence / stop token IDs for generation.
+    Safely verifies that candidate special tokens actually exist in the tokenizer
+    vocabulary and cannot accidentally alias unknown-token IDs, pad IDs, or unmapped tokens.
+    """
+    stop_token_ids = set()
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        if isinstance(tokenizer.eos_token_id, list):
+            stop_token_ids.update(tokenizer.eos_token_id)
+        else:
+            stop_token_ids.add(tokenizer.eos_token_id)
+
+    gen_config = getattr(model, "generation_config", None) if model is not None else None
+    if gen_config is not None and getattr(gen_config, "eos_token_id", None) is not None:
+        cfg_eos = gen_config.eos_token_id
+        if isinstance(cfg_eos, list):
+            stop_token_ids.update(cfg_eos)
+        elif isinstance(cfg_eos, int):
+            stop_token_ids.add(cfg_eos)
+
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else None
+
+    for end_tok in ("<|im_end|>", "<|eot_id|>", "</s>"):
+        try:
+            if vocab is not None:
+                if end_tok in vocab:
+                    tid = vocab[end_tok]
+                    if isinstance(tid, int) and tid != unk_id and tid != pad_id and tid >= 0:
+                        stop_token_ids.add(tid)
+            else:
+                tid = tokenizer.convert_tokens_to_ids(end_tok)
+                if isinstance(tid, int) and tid != unk_id and tid != pad_id and tid >= 0:
+                    decoded = tokenizer.decode([tid], skip_special_tokens=False).strip()
+                    if decoded == end_tok:
+                        stop_token_ids.add(tid)
+        except Exception:
+            pass
+
+    return stop_token_ids
+
+
 def cmd_chat(args):
     """Subcommand: Interactive streaming chat REPL with optional quantization and live metrics."""
     from src.memory.preflight import enforce_preflight_check
@@ -632,29 +676,8 @@ def cmd_chat(args):
         savings = (1.0 - (quant_bytes / orig_bytes)) * 100 if orig_bytes > 0 else 0.0
         print(f" {Colors.GREEN}Applied {args.quant.upper()} quantization ({savings:.1f}% VRAM freed){Colors.RESET}")
 
-    # Build comprehensive set of stop token IDs (handles single int, list of ints, and template end tokens)
-    stop_token_ids = set()
-    if tokenizer.eos_token_id is not None:
-        if isinstance(tokenizer.eos_token_id, list):
-            stop_token_ids.update(tokenizer.eos_token_id)
-        else:
-            stop_token_ids.add(tokenizer.eos_token_id)
-
-    gen_config = getattr(model, "generation_config", None)
-    if gen_config is not None and getattr(gen_config, "eos_token_id", None) is not None:
-        cfg_eos = gen_config.eos_token_id
-        if isinstance(cfg_eos, list):
-            stop_token_ids.update(cfg_eos)
-        elif isinstance(cfg_eos, int):
-            stop_token_ids.add(cfg_eos)
-
-    for end_tok in ("<|im_end|>", "<|eot_id|>", "</s>"):
-        try:
-            tid = tokenizer.convert_tokens_to_ids(end_tok)
-            if isinstance(tid, int) and tid != getattr(tokenizer, "unk_token_id", None) and tid > 0:
-                stop_token_ids.add(tid)
-        except Exception:
-            pass
+    # Build comprehensive set of stop token IDs (handles single int, list of ints, and verified template end tokens)
+    stop_token_ids = get_stopping_criteria_token_ids(tokenizer, model)
 
     print(f"\n{Colors.GREEN}{Colors.BOLD}● Engine online! Type your message below:{Colors.RESET}\n")
 
