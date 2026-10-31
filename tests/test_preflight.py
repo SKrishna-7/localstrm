@@ -167,3 +167,135 @@ def test_cli_list_models_flag_parsing():
 
     args5 = parser.parse_args(["list-models"])
     assert args5.subcommand == "list-models"
+
+
+def test_hf_home_cache_path_detects_cached_model(monkeypatch, tmp_path):
+    """Verifies that setting HF_HOME properly resolves hub subdirectory and detects cached models with download_needed=0."""
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+
+    hub_dir = tmp_path / "hub"
+    repo_dir = hub_dir / "models--org--cached-model"
+    snap_dir = repo_dir / "snapshots" / "rev123"
+    snap_dir.mkdir(parents=True)
+    (snap_dir / "config.json").write_text(json.dumps({
+        "hidden_size": 896,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 14,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+        "vocab_size": 151936,
+    }))
+    weight_bytes = 2048
+    (snap_dir / "model.safetensors").write_bytes(b"0" * weight_bytes)
+
+    # Hardware capacity should resolve cache_dir to tmp_path/hub
+    hw = preflight.get_hardware_capacity(device_str="cpu")
+    assert hw.cache_dir == str(hub_dir)
+
+    # Preflight should detect the model as cached under HF_HOME/hub
+    report = preflight.validate_model_preflight("org/cached-model", device="cpu")
+    assert report.fits_disk is True
+    assert report.fits_memory is True
+    assert report.can_run is True
+
+
+def test_filter_weight_files_prefers_safetensors(tmp_path):
+    """Verifies that filter_weight_files prefers .safetensors over .bin/.pt to prevent double counting."""
+    entries = [
+        ("model.safetensors", 1024),
+        ("pytorch_model.bin", 1024),
+        ("model.pt", 1024),
+    ]
+    filtered = preflight.filter_weight_files(entries)
+    assert len(filtered) == 1
+    assert filtered[0] == ("model.safetensors", 1024)
+
+    # When no safetensors exist, .bin/.pt files are returned
+    bin_entries = [("pytorch_model.bin", 1024), ("model.pt", 512)]
+    assert preflight.filter_weight_files(bin_entries) == bin_entries
+
+    # Local directory scan with both formats should count only safetensors
+    model_dir = tmp_path / "dual_format_model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({
+        "hidden_size": 896,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 14,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+    }))
+    (model_dir / "model.safetensors").write_bytes(b"0" * 2048)
+    (model_dir / "pytorch_model.bin").write_bytes(b"0" * 2048)
+
+    meta = preflight.get_model_metadata(str(model_dir))
+    assert meta.weight_bytes == 2048  # Only safetensors counted, not 4096
+
+
+def test_offline_mode_falls_back_to_local_snapshot(monkeypatch, tmp_path):
+    """Verifies that when model_info fails (e.g. HF_HUB_OFFLINE=1), preflight recovers via cached snapshot."""
+    class FailingHfApi:
+        def model_info(self, *args, **kwargs):
+            raise OSError("Offline mode active: model_info failed")
+
+    monkeypatch.setattr(preflight, "HfApi", FailingHfApi)
+
+    cached_snap = tmp_path / "cached_snapshot"
+    cached_snap.mkdir()
+    (cached_snap / "config.json").write_text(json.dumps({
+        "hidden_size": 896,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 14,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+        "vocab_size": 151936,
+    }))
+    (cached_snap / "model.safetensors").write_bytes(b"0" * 4096)
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        assert kwargs.get("local_files_only") is True
+        return str(cached_snap)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+
+    report = preflight.validate_model_preflight("org/offline-cached-model", device="cpu")
+    assert report.model_id == "org/offline-cached-model"
+    assert report.fits_memory is True
+    assert report.can_run is True
+    assert report.parameter_count == 4096 // 2
+
+
+def test_single_source_of_truth_constants():
+    """Verifies module constants in preflight.py match expected unified values."""
+    assert preflight.SAFETY_MARGIN_FRACTION == 0.05
+    assert preflight.CUDA_CONTEXT_BYTES == int(450 * (1024**2))
+    assert preflight.CPU_OVERHEAD_BYTES == int(400 * (1024**2))
+    assert preflight.CHUNKED_WORKSPACE_BYTES == int(64 * (1024**2))
+    assert preflight.MONOLITHIC_WORKSPACE_BYTES == int(450 * (1024**2))
+    assert preflight.DEFAULT_SAFETY_MARGIN_BYTES == int(128 * (1024**2))
+    assert preflight.DISK_SAFETY_BUFFER_FRACTION == 0.10
+
+
+def test_missing_architectural_fields_fails_closed(tmp_path):
+    """Verifies that missing architectural fields fail closed rather than guessing defaults."""
+    model_dir = tmp_path / "incomplete_model"
+    model_dir.mkdir()
+    # Missing num_hidden_layers
+    (model_dir / "config.json").write_text(json.dumps({
+        "hidden_size": 896,
+        "num_attention_heads": 14,
+        "num_key_value_heads": 2,
+        "head_dim": 64,
+    }))
+    (model_dir / "model.safetensors").write_bytes(b"0" * 1024)
+
+    # Without force: must reject execution with clear recommendation
+    report = preflight.validate_model_preflight(str(model_dir), device="cpu", force=False)
+    assert report.fits_memory is False
+    assert report.can_run is False
+    assert any("num_hidden_layers" in rec for rec in report.recommendations)
+
+    # With force: can_run is True only because force overrides
+    report_forced = preflight.validate_model_preflight(str(model_dir), device="cpu", force=True)
+    assert report_forced.fits_memory is False
+    assert report_forced.can_run is True

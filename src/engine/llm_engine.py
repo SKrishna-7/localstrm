@@ -340,6 +340,7 @@ class MiniVLLMEngine:
         verbose: bool = False,
         tokenizer: Optional[Any] = None,
         model: Optional[Any] = None,
+        trust_remote_code: bool = False,
     ):
         if total_blocks is not None and vram_budget is not None:
             raise ValueError(
@@ -358,7 +359,7 @@ class MiniVLLMEngine:
                 vram_budget_bytes = parse_vram_budget_bytes(vram_budget)
 
             self.config = EngineConfig(
-                model=ModelConfig.from_str(resolved_model, device=resolved_device),
+                model=ModelConfig.from_str(resolved_model, device=resolved_device, trust_remote_code=trust_remote_code),
                 cache=CacheConfig(
                     block_size=block_size,
                     total_blocks=total_blocks,
@@ -374,9 +375,14 @@ class MiniVLLMEngine:
                 ),
                 device=resolved_device,
                 quantization=quantization,
+                trust_remote_code=trust_remote_code,
             )
         else:
             self.config = config
+            if trust_remote_code:
+                self.config.trust_remote_code = True
+                if hasattr(self.config, "model") and hasattr(self.config.model, "trust_remote_code"):
+                    self.config.model.trust_remote_code = True
             if batched_decode is not None:
                 self.config.scheduler.batched_decode = batched_decode
             if total_blocks is not None and self.config.cache.vram_budget_bytes is not None:
@@ -439,6 +445,7 @@ class MiniVLLMEngine:
                 chunked_prefill=self.chunked_prefill,
                 metadata=meta,
                 raise_on_error=True,
+                trust_remote_code=getattr(self.config, "trust_remote_code", False),
             )
             self.budget_resolution = budget_est
             self.total_blocks = budget_est.total_blocks
@@ -455,10 +462,11 @@ class MiniVLLMEngine:
             if self.budget_resolution is not None:
                 logger.info("VRAM Budget Resolution: %s", self.budget_resolution.summary())
 
+        trust_remote = getattr(self.config, "trust_remote_code", False)
         if tokenizer is not None:
             self.tokenizer = tokenizer
         else:
-            self.tokenizer = AutoTokenizer.from_pretrained(target_model)
+            self.tokenizer = AutoTokenizer.from_pretrained(target_model, trust_remote_code=trust_remote)
 
         dtype = torch.float32 if self.device.type == "cpu" else torch.float16
         if model is not None:
@@ -471,10 +479,34 @@ class MiniVLLMEngine:
                 device=self.device,
                 quantization=self.config.quantization,
                 dtype=dtype,
-                logger=logger
+                logger=logger,
+                trust_remote_code=trust_remote
             )
 
         model_cfg = self.model.config
+        is_enc_dec = getattr(model_cfg, "is_encoder_decoder", False)
+        is_decoder_only = getattr(model_cfg, "is_decoder", True) and not is_enc_dec
+        m_type = str(getattr(model_cfg, "model_type", "")).lower()
+        unsupported_types = {"liquid_lfm", "lfm3", "t5", "bloom", "falcon", "gpt2", "mamba", "rwkv", "bert", "roberta"}
+        has_layers = getattr(model_cfg, "num_hidden_layers", None) is not None
+        has_heads = getattr(model_cfg, "num_attention_heads", None) is not None
+
+        if (
+            not has_layers
+            or not has_heads
+            or is_enc_dec
+            or not is_decoder_only
+            or m_type in unsupported_types
+        ):
+            arch_name = model_cfg.__class__.__name__
+            detail = f" (model_type: '{m_type}')" if m_type else ""
+            if is_enc_dec:
+                detail += " [encoder-decoder]"
+            raise ValueError(
+                f"Unsupported model architecture '{arch_name}'{detail}. "
+                f"MiniVLLMEngine requires decoder-only transformer models with standard "
+                f"attention heads and layers (e.g. LLaMA, Qwen2, Mistral). For unsupported architectures, use '--engine hf'."
+            )
         self.num_layers = model_cfg.num_hidden_layers
         self.num_heads = model_cfg.num_attention_heads
         self.num_kv_heads = getattr(model_cfg, "num_key_value_heads", self.num_heads)
@@ -583,6 +615,11 @@ class MiniVLLMEngine:
                 req.finish_time, req.finish_time_ns = _sample_paired_timestamp(self.device)
                 if req not in self.completed_requests:
                     self.completed_requests.append(req)
+                self.metrics.record_request_failed(
+                    error_type="abort",
+                    prompt_tokens=0,
+                    generated_tokens=0
+                )
                 self._update_queue_and_cache_metrics()
                 return True
 
@@ -604,10 +641,12 @@ class MiniVLLMEngine:
                         logger.exception("Failed to release block %s on abort", b_id)
                 if req not in self.completed_requests:
                     self.completed_requests.append(req)
-                self.metrics.record_request_completed(
-                    prompt_tokens=len(req.prompt_token_ids),
-                    generated_tokens=req.num_generated,
-                    e2e_latency_ms=(time.perf_counter() - req.arrival_time) * 1000.0
+                p_tokens = req.num_prefilled_tokens
+                g_tokens = req.num_generated
+                self.metrics.record_request_failed(
+                    error_type="abort",
+                    prompt_tokens=p_tokens,
+                    generated_tokens=g_tokens
                 )
                 self._update_queue_and_cache_metrics()
                 return True
@@ -698,6 +737,11 @@ class MiniVLLMEngine:
                 )
                 req.finish_step = current_step
                 req.finish_time, req.finish_time_ns = _sample_paired_timestamp(self.device)
+                self.metrics.record_request_failed(
+                    error_type="kv_cache_full",
+                    prompt_tokens=0,
+                    generated_tokens=0
+                )
                 self._update_queue_and_cache_metrics()
                 err = MemoryError(req.error)
                 err.request = req
@@ -782,8 +826,8 @@ class MiniVLLMEngine:
                     now_t, now_t_ns = _sample_paired_timestamp(self.device)
                     req.first_token_time = now_t
                     req.first_token_time_ns = now_t_ns
-                    ref_time = req.schedule_time if req.schedule_time is not None else req.arrival_time
-                    req.ttft_ms = max(0.1, (now_t - ref_time) * 1000.0)
+                    ref_time = req.arrival_time if req.arrival_time > 0.0 else (req.schedule_time if req.schedule_time is not None else now_t)
+                    req.ttft_ms = max(0.0, (now_t - ref_time) * 1000.0)
                     self.metrics.record_ttft(req.ttft_ms)
                     should_stop, reason = check_stop_criteria(
                         req.output_token_ids,
@@ -819,6 +863,9 @@ class MiniVLLMEngine:
 
             if not completed_from_cache:
                 self.running_batch.append(req)
+
+            if self.enable_prefix_caching and self.prefix_cache:
+                self.metrics.record_prefix_cache_hit_rate(prefix_hit_tokens, num_tokens)
 
             if self.verbose:
                 if prefix_hit_tokens > 0:
@@ -960,8 +1007,8 @@ class MiniVLLMEngine:
                     req.first_token_time = t_first_token
                     req.first_token_time_ns = t_first_token_ns
                 if req.ttft_ms is None:
-                    ref_time = req.schedule_time if req.schedule_time is not None else req.arrival_time
-                    req.ttft_ms = max(0.1, (t_first_token - ref_time) * 1000.0)
+                    ref_time = req.arrival_time if req.arrival_time > 0.0 else (req.schedule_time if req.schedule_time is not None else t_first_token)
+                    req.ttft_ms = max(0.0, (t_first_token - ref_time) * 1000.0)
                     self.metrics.record_ttft(req.ttft_ms)
 
                 # Check stop criteria on first token
@@ -1047,11 +1094,10 @@ class MiniVLLMEngine:
                     if req not in self.completed_requests:
                         self.completed_requests.append(req)
 
-                    e2e_ms = (time.perf_counter() - req.arrival_time) * 1000.0
-                    self.metrics.record_request_completed(
+                    self.metrics.record_request_failed(
+                        error_type=stop_reason,
                         prompt_tokens=len(req.prompt_token_ids),
-                        generated_tokens=req.num_generated,
-                        e2e_latency_ms=e2e_ms
+                        generated_tokens=req.num_generated
                     )
                     if is_cuda_oom and torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -1182,6 +1228,13 @@ class MiniVLLMEngine:
             req.finish_time, req.finish_time_ns = _sample_paired_timestamp(self.device)
             if req not in self.completed_requests:
                 self.completed_requests.append(req)
+            p_tokens = req.num_prefilled_tokens
+            g_tokens = req.num_generated
+            self.metrics.record_request_failed(
+                error_type=stop_reason,
+                prompt_tokens=p_tokens,
+                generated_tokens=g_tokens
+            )
 
             block_ids = list(req.physical_block_ids)
             req.physical_block_ids.clear()

@@ -1,5 +1,5 @@
 """
-Milestone 8: Automatic Prefix Caching (Radix / Hash-Based Block Deduplication)
+Milestone 8: Automatic Prefix Caching (Content-Addressed Chained Block-Hash Deduplication)
 -----------------------------------------------------------------------------
 Implements content-addressed physical block deduplication:
   1. Hashes token chunks with parent context: hash(parent_hash, tuple(tokens)).

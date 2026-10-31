@@ -432,6 +432,80 @@ class TestQuantizedModelLoader(unittest.TestCase):
             # Assert .to(target_device) was called after quantization
             mock_model.to.assert_any_call(target_device)
 
+    # --------------------------------------------------------------------------
+    # 12. INT4 Memory-Efficient In-Place Dequantization Numerical Equivalence
+    # --------------------------------------------------------------------------
+    def test_int4_slice_dequantization_numerical_equivalence(self):
+        """
+        Regression test: Verify that memory-efficient slice unpacking produces
+        exact identical tensors to separate low/high tensor unpacking for both
+        even and odd in_features dimensions.
+        """
+        for in_features in (32, 33, 128, 1536):
+            float_layer = nn.Linear(in_features, 64, bias=False)
+            ql = QuantizedLinear.from_float(float_layer, quant_type="int4")
+
+            # Reference unpacking method
+            low = (ql.weight_packed & 0x0F).to(torch.int8) - 8
+            high = ((ql.weight_packed >> 4) & 0x0F).to(torch.int8) - 8
+            unpacked_ref = torch.empty((ql.out_features, ql.in_features), dtype=torch.int8)
+            unpacked_ref[:, 0::2] = low[:, :unpacked_ref[:, 0::2].shape[1]]
+            unpacked_ref[:, 1::2] = high[:, :unpacked_ref[:, 1::2].shape[1]]
+            w_ref = unpacked_ref.float() * ql.scale
+
+            # Optimized implementation method under test
+            w_actual = qlayer_dequant = ql.dequantize()
+            self.assertTrue(torch.equal(w_ref, w_actual), f"Mismatch for in_features={in_features}")
+
+            # Verify target dtype support
+            w_fp16 = ql.dequantize(dtype=torch.float16)
+            self.assertEqual(w_fp16.dtype, torch.float16)
+            self.assertLessEqual((w_fp16.float() - w_ref).abs().max().item(), 1e-3)
+
+    # --------------------------------------------------------------------------
+    # 13. Unsupported Architecture Diagnostics in apply_optional_quantization
+    # --------------------------------------------------------------------------
+    def test_apply_optional_quantization_unsupported_architecture(self):
+        """
+        Regression test: Verify that apply_optional_quantization raises a helpful
+        ValueError when passed a model architecture that lacks standard transformer
+        linear projections (e.g., non-decoder models or custom architectures like LFM3).
+        """
+        unsupported_model = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64)
+        )
+
+        for quant_mode in ("int8", "int4", "hybrid_int8"):
+            with self.assertRaises(ValueError) as ctx:
+                apply_optional_quantization(unsupported_model, quant_type=quant_mode)
+            err_msg = str(ctx.exception)
+            self.assertIn(f"Quantization '{quant_mode}' failed", err_msg)
+            self.assertIn("no compatible linear layers found", err_msg)
+            self.assertIn("Supported architectures require transformer blocks", err_msg)
+
+    # --------------------------------------------------------------------------
+    # 14. trust_remote_code Parameter Pass-Through
+    # --------------------------------------------------------------------------
+    def test_load_and_quantize_model_trust_remote_code(self):
+        """
+        Regression test: Verify that load_and_quantize_model forwards trust_remote_code
+        to AutoModelForCausalLM.from_pretrained to prevent Windows SIGALRM crashes.
+        """
+        mock_model = create_seeded_synthetic_model(seed=42)
+        with patch("transformers.AutoModelForCausalLM.from_pretrained", return_value=mock_model) as mock_from_pretrained:
+            load_and_quantize_model("custom/model-id", device="cpu", quantization="none", trust_remote_code=True)
+            mock_from_pretrained.assert_called_once()
+            _, kwargs = mock_from_pretrained.call_args
+            self.assertTrue(kwargs.get("trust_remote_code"))
+
+        with patch("transformers.AutoModelForCausalLM.from_pretrained", return_value=mock_model) as mock_from_pretrained:
+            load_and_quantize_model("custom/model-id", device="cpu", quantization="none", trust_remote_code=False)
+            mock_from_pretrained.assert_called_once()
+            _, kwargs = mock_from_pretrained.call_args
+            self.assertFalse(kwargs.get("trust_remote_code"))
+
 
 if __name__ == "__main__":
     unittest.main()

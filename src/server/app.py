@@ -35,6 +35,8 @@ from src.server.protocol import (
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
+    CompletionChunk,
+    CompletionResponseStreamChoice,
     UsageInfo,
     ModelCard,
     ModelList,
@@ -251,8 +253,19 @@ def create_app(engine: AsyncServingEngine) -> FastAPI:
                 )
                 yield f"data: {first_chunk.model_dump_json()}\n\n"
 
+                prompt_token_count = len(engine.tokenizer.encode(prompt)) if getattr(engine, "tokenizer", None) is not None else 0
+                completion_token_count = 0
+
                 try:
-                    async for token_text, _, is_last, finish_reason in engine.generate_stream(prompt, sampling_params, max_tokens):
+                    async for stream_item in engine.generate_stream(prompt, sampling_params, max_tokens):
+                        token_text, _, is_last, finish_reason = stream_item
+                        if hasattr(stream_item, "completion_tokens"):
+                            completion_token_count = stream_item.completion_tokens
+                        else:
+                            completion_token_count += 1
+                        if hasattr(stream_item, "prompt_tokens") and stream_item.prompt_tokens > 0:
+                            prompt_token_count = stream_item.prompt_tokens
+
                         chunk = ChatCompletionChunk(
                             id=req_id,
                             created=created_ts,
@@ -266,6 +279,20 @@ def create_app(engine: AsyncServingEngine) -> FastAPI:
                             ]
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
+
+                    if req.stream_options and req.stream_options.include_usage:
+                        usage_chunk = ChatCompletionChunk(
+                            id=req_id,
+                            created=created_ts,
+                            model=req.model,
+                            choices=[],
+                            usage=UsageInfo(
+                                prompt_tokens=prompt_token_count,
+                                completion_tokens=completion_token_count,
+                                total_tokens=prompt_token_count + completion_token_count
+                            )
+                        )
+                        yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
                     yield "data: [DONE]\n\n"
                 except (GeneratorExit, asyncio.CancelledError):
@@ -397,22 +424,46 @@ def create_app(engine: AsyncServingEngine) -> FastAPI:
             async def sse_text_generator() -> AsyncGenerator[str, None]:
                 req_id = f"cmpl-{uuid.uuid4().hex[:12]}"
                 created_ts = int(time.time())
+                prompt_token_count = len(engine.tokenizer.encode(prompt)) if getattr(engine, "tokenizer", None) is not None else 0
+                completion_token_count = 0
                 try:
-                    async for token_text, _, is_last, finish_reason in engine.generate_stream(prompt, sampling_params, max_tokens):
-                        chunk_dict = {
-                            "id": req_id,
-                            "object": "text_completion",
-                            "created": created_ts,
-                            "model": req.model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "text": token_text,
-                                    "finish_reason": finish_reason if is_last else None
-                                }
+                    async for stream_item in engine.generate_stream(prompt, sampling_params, max_tokens):
+                        token_text, _, is_last, finish_reason = stream_item
+                        if hasattr(stream_item, "completion_tokens"):
+                            completion_token_count = stream_item.completion_tokens
+                        else:
+                            completion_token_count += 1
+                        if hasattr(stream_item, "prompt_tokens") and stream_item.prompt_tokens > 0:
+                            prompt_token_count = stream_item.prompt_tokens
+
+                        chunk = CompletionChunk(
+                            id=req_id,
+                            created=created_ts,
+                            model=req.model,
+                            choices=[
+                                CompletionResponseStreamChoice(
+                                    index=0,
+                                    text=token_text,
+                                    finish_reason=finish_reason if is_last else None
+                                )
                             ]
-                        }
-                        yield f"data: {json.dumps(chunk_dict)}\n\n"
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+
+                    if req.stream_options and req.stream_options.include_usage:
+                        usage_chunk = CompletionChunk(
+                            id=req_id,
+                            created=created_ts,
+                            model=req.model,
+                            choices=[],
+                            usage=UsageInfo(
+                                prompt_tokens=prompt_token_count,
+                                completion_tokens=completion_token_count,
+                                total_tokens=prompt_token_count + completion_token_count
+                            )
+                        )
+                        yield f"data: {usage_chunk.model_dump_json()}\n\n"
+
                     yield "data: [DONE]\n\n"
                 except (GeneratorExit, asyncio.CancelledError):
                     raise

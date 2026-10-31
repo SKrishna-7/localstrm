@@ -196,6 +196,9 @@ def test_prometheus_metrics_endpoint():
     assert "vllm_requests_completed_total" in text or "vllm_generation_tokens_total" in text
     assert "vllm_time_to_first_token_seconds" in text
     assert "vllm_time_per_output_token_seconds" in text
+    assert "vllm_requests_failed_total" in text
+    assert "vllm_gpu_cache_allocated_blocks" in text
+    assert "vllm_gpu_cache_total_blocks" in text
 
 
 # =========================================================================
@@ -449,6 +452,110 @@ def test_internal_stream_exception_cleanup():
     assert engine.metrics.requests_completed_total == initial_completed
 
 
+def test_serving_engine_failure_before_prefill():
+    """Verify failure before prefill (e.g. tokenization error) records error without crediting prompt/generation tokens."""
+    import asyncio
+    from unittest.mock import patch
+    from src.engine.sampling import SamplingParams
+    _, engine, _ = get_test_client()
+
+    initial_completed = engine.metrics.requests_completed_total
+    initial_prompt_tokens = engine.metrics.prompt_tokens_total
+    initial_gen_tokens = engine.metrics.generation_tokens_total
+    initial_failed = engine.metrics.requests_failed_total.get("error", 0)
+
+    loop = asyncio.new_event_loop()
+    try:
+        with patch.object(engine.tokenizer, "encode", side_effect=ValueError("Tokenization fault")):
+            gen = engine.generate_stream(
+                "Trigger before-prefill exception",
+                sampling_params=SamplingParams(temperature=0.0),
+                max_tokens=10
+            )
+            with pytest.raises(ValueError, match="Tokenization fault"):
+                loop.run_until_complete(gen.__anext__())
+    finally:
+        loop.close()
+
+    assert engine.metrics.num_requests_running == 0
+    assert engine.metrics.requests_completed_total == initial_completed
+    assert engine.metrics.prompt_tokens_total == initial_prompt_tokens
+    assert engine.metrics.generation_tokens_total == initial_gen_tokens
+    assert engine.metrics.requests_failed_total.get("error", 0) == initial_failed + 1
+
+
+def test_serving_engine_cuda_oom_during_prefill():
+    """Verify CUDA OOM during prefill records failure without crediting prompt or generation tokens."""
+    import asyncio
+    from unittest.mock import patch
+    import torch
+    from src.engine.sampling import SamplingParams
+    _, engine, _ = get_test_client()
+
+    initial_completed = engine.metrics.requests_completed_total
+    initial_prompt_tokens = engine.metrics.prompt_tokens_total
+    initial_gen_tokens = engine.metrics.generation_tokens_total
+    initial_failed = engine.metrics.requests_failed_total.get("cuda_oom", 0)
+
+    loop = asyncio.new_event_loop()
+    try:
+        with patch.object(engine.model, "forward", side_effect=torch.cuda.OutOfMemoryError("CUDA OOM during prefill")):
+            gen = engine.generate_stream(
+                "Trigger prefill CUDA OOM",
+                sampling_params=SamplingParams(temperature=0.0),
+                max_tokens=10
+            )
+            with pytest.raises(torch.cuda.OutOfMemoryError, match="CUDA OOM during prefill"):
+                loop.run_until_complete(gen.__anext__())
+    finally:
+        loop.close()
+
+    assert engine.metrics.num_requests_running == 0
+    assert engine.metrics.requests_completed_total == initial_completed
+    assert engine.metrics.prompt_tokens_total == initial_prompt_tokens
+    assert engine.metrics.generation_tokens_total == initial_gen_tokens
+    assert engine.metrics.requests_failed_total.get("cuda_oom", 0) == initial_failed + 1
+
+
+def test_serving_engine_partial_generation_accounting_on_abort():
+    """Verify partial generation tokens are credited exactly once when stream is aborted mid-flight."""
+    import asyncio
+    from src.engine.sampling import SamplingParams
+    _, engine, _ = get_test_client()
+
+    initial_completed = engine.metrics.requests_completed_total
+    initial_prompt_tokens = engine.metrics.prompt_tokens_total
+    initial_gen_tokens = engine.metrics.generation_tokens_total
+    initial_failed_abort = engine.metrics.requests_failed_total.get("abort", 0)
+
+    loop = asyncio.new_event_loop()
+    try:
+        gen = engine.generate_stream(
+            "Hello world partial test prompt",
+            sampling_params=SamplingParams(temperature=0.0),
+            max_tokens=10
+        )
+        # Consume first 2 tokens (prefill chunk + 1 decode step)
+        t1 = loop.run_until_complete(gen.__anext__())
+        assert t1[1] is True  # is_first
+        t2 = loop.run_until_complete(gen.__anext__())
+        assert t2[1] is False
+
+        # Now explicitly close / abort the generator mid-flight
+        loop.run_until_complete(gen.aclose())
+    finally:
+        loop.close()
+
+    expected_p_tokens = len(engine.tokenizer.encode("Hello world partial test prompt"))
+    assert engine.metrics.num_requests_running == 0
+    assert engine.metrics.requests_completed_total == initial_completed
+    assert engine.metrics.requests_failed_total.get("abort", 0) == initial_failed_abort + 1
+    # Prompt tokens accounted because prefill completed
+    assert engine.metrics.prompt_tokens_total == initial_prompt_tokens + expected_p_tokens
+    # Generated tokens accounted exactly once (2 tokens emitted before aclose)
+    assert engine.metrics.generation_tokens_total == initial_gen_tokens + 2
+
+
 def test_async_task_cancellation_releases_lock_and_counter():
     import asyncio
     from src.engine.sampling import SamplingParams
@@ -515,6 +622,199 @@ def test_completion_empty_prompt_validation():
     assert len(resp.json()["choices"]) == 1
 
 
+def test_chat_streaming_omitted_stream_options():
+    """Verify chat streaming with omitted stream_options does not emit usage chunk."""
+    client, engine, _ = get_test_client()
+    payload = {
+        "model": engine.model_name,
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "stream": True,
+    }
+    with client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line.strip() for line in resp.iter_lines() if line.strip()]
+
+    assert lines[-1] == "data: [DONE]"
+    for line in lines[:-1]:
+        chunk = json.loads(line[6:])
+        assert "usage" not in chunk or chunk["usage"] is None
+
+
+def test_chat_streaming_empty_stream_options():
+    """Verify chat streaming with stream_options={} defaults include_usage to False."""
+    client, engine, _ = get_test_client()
+    payload = {
+        "model": engine.model_name,
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "stream": True,
+        "stream_options": {},
+    }
+    with client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line.strip() for line in resp.iter_lines() if line.strip()]
+
+    assert lines[-1] == "data: [DONE]"
+    for line in lines[:-1]:
+        chunk = json.loads(line[6:])
+        assert "usage" not in chunk or chunk["usage"] is None
+
+
+def test_chat_streaming_include_usage_false():
+    """Verify chat streaming with stream_options.include_usage=False does not emit usage chunk."""
+    client, engine, _ = get_test_client()
+    payload = {
+        "model": engine.model_name,
+        "messages": [{"role": "user", "content": "Hello"}],
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "stream": True,
+        "stream_options": {"include_usage": False},
+    }
+    with client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line.strip() for line in resp.iter_lines() if line.strip()]
+
+    assert lines[-1] == "data: [DONE]"
+    for line in lines[:-1]:
+        chunk = json.loads(line[6:])
+        assert "usage" not in chunk or chunk["usage"] is None
+
+
+def test_chat_streaming_with_stream_options_usage():
+    """Verify chat streaming with stream_options.include_usage=True emits final usage chunk before [DONE]."""
+    client, engine, _ = get_test_client()
+    payload = {
+        "model": engine.model_name,
+        "messages": [
+            {"role": "user", "content": "Say hello in one word."}
+        ],
+        "max_tokens": 8,
+        "temperature": 0.0,
+        "stream": True,
+        "stream_options": {"include_usage": True}
+    }
+
+    with client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line.strip() for line in resp.iter_lines() if line.strip()]
+
+    assert lines[-1] == "data: [DONE]"
+    usage_line = lines[-2]
+    assert usage_line.startswith("data: ")
+    usage_chunk = json.loads(usage_line[6:])
+
+    assert usage_chunk["object"] == "chat.completion.chunk"
+    assert usage_chunk["choices"] == []
+    assert "usage" in usage_chunk
+    assert usage_chunk["usage"]["prompt_tokens"] > 0
+    assert usage_chunk["usage"]["completion_tokens"] > 0
+    assert usage_chunk["usage"]["total_tokens"] == usage_chunk["usage"]["prompt_tokens"] + usage_chunk["usage"]["completion_tokens"]
+
+    content_chunks = [json.loads(l[6:]) for l in lines[:-2] if l.startswith("data: ")]
+    # Chunk 0 is the initial role chunk; chunks 1..N correspond to generated tokens (including EOS finish chunk)
+    token_chunks = content_chunks[1:]
+    assert usage_chunk["usage"]["completion_tokens"] == len(token_chunks)
+
+
+def test_legacy_streaming_omitted_stream_options():
+    """Verify legacy completions streaming with omitted stream_options does not emit usage chunk."""
+    client, engine, _ = get_test_client()
+    payload = {
+        "model": engine.model_name,
+        "prompt": "Hello world",
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "stream": True,
+    }
+    with client.stream("POST", "/v1/completions", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line.strip() for line in resp.iter_lines() if line.strip()]
+
+    assert lines[-1] == "data: [DONE]"
+    for line in lines[:-1]:
+        chunk = json.loads(line[6:])
+        assert "usage" not in chunk or chunk["usage"] is None
+
+
+def test_legacy_streaming_empty_stream_options():
+    """Verify legacy completions streaming with stream_options={} defaults include_usage to False."""
+    client, engine, _ = get_test_client()
+    payload = {
+        "model": engine.model_name,
+        "prompt": "Hello world",
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "stream": True,
+        "stream_options": {},
+    }
+    with client.stream("POST", "/v1/completions", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line.strip() for line in resp.iter_lines() if line.strip()]
+
+    assert lines[-1] == "data: [DONE]"
+    for line in lines[:-1]:
+        chunk = json.loads(line[6:])
+        assert "usage" not in chunk or chunk["usage"] is None
+
+
+def test_legacy_streaming_include_usage_false():
+    """Verify legacy completions streaming with stream_options.include_usage=False does not emit usage chunk."""
+    client, engine, _ = get_test_client()
+    payload = {
+        "model": engine.model_name,
+        "prompt": "Hello world",
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "stream": True,
+        "stream_options": {"include_usage": False},
+    }
+    with client.stream("POST", "/v1/completions", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line.strip() for line in resp.iter_lines() if line.strip()]
+
+    assert lines[-1] == "data: [DONE]"
+    for line in lines[:-1]:
+        chunk = json.loads(line[6:])
+        assert "usage" not in chunk or chunk["usage"] is None
+
+
+def test_legacy_streaming_with_stream_options_usage():
+    """Verify legacy completions streaming with stream_options.include_usage=True emits final usage chunk before [DONE]."""
+    client, engine, _ = get_test_client()
+    payload = {
+        "model": engine.model_name,
+        "prompt": "Hello world",
+        "max_tokens": 6,
+        "temperature": 0.0,
+        "stream": True,
+        "stream_options": {"include_usage": True}
+    }
+
+    with client.stream("POST", "/v1/completions", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line.strip() for line in resp.iter_lines() if line.strip()]
+
+    assert lines[-1] == "data: [DONE]"
+    usage_line = lines[-2]
+    assert usage_line.startswith("data: ")
+    usage_chunk = json.loads(usage_line[6:])
+
+    assert usage_chunk["object"] == "text_completion"
+    assert usage_chunk["choices"] == []
+    assert "usage" in usage_chunk
+    expected_prompt_tokens = len(engine.tokenizer.encode(payload["prompt"]))
+    assert usage_chunk["usage"]["prompt_tokens"] == expected_prompt_tokens
+    assert usage_chunk["usage"]["completion_tokens"] > 0
+    assert usage_chunk["usage"]["total_tokens"] == usage_chunk["usage"]["prompt_tokens"] + usage_chunk["usage"]["completion_tokens"]
+
+    content_chunks = [json.loads(l[6:]) for l in lines[:-2] if l.startswith("data: ")]
+    assert usage_chunk["usage"]["completion_tokens"] == len(content_chunks)
+
+
 # =========================================================================
 # Standalone CLI Test Runner
 # =========================================================================
@@ -529,7 +829,15 @@ if __name__ == "__main__":
         ("Model Catalog (/v1/models)", test_v1_models_catalog),
         ("Chat Completions (JSON Non-Streaming)", test_chat_completions_non_streaming),
         ("Chat Completions (SSE Streaming)", test_chat_completions_streaming_sse),
+        ("Chat Streaming: Omitted stream_options", test_chat_streaming_omitted_stream_options),
+        ("Chat Streaming: Empty stream_options={}", test_chat_streaming_empty_stream_options),
+        ("Chat Streaming: include_usage=False", test_chat_streaming_include_usage_false),
+        ("Chat Streaming: include_usage=True", test_chat_streaming_with_stream_options_usage),
         ("Legacy Text Completions (/v1/completions)", test_legacy_text_completions),
+        ("Legacy Streaming: Omitted stream_options", test_legacy_streaming_omitted_stream_options),
+        ("Legacy Streaming: Empty stream_options={}", test_legacy_streaming_empty_stream_options),
+        ("Legacy Streaming: include_usage=False", test_legacy_streaming_include_usage_false),
+        ("Legacy Streaming: include_usage=True", test_legacy_streaming_with_stream_options_usage),
         ("Prometheus Metrics (/metrics)", test_prometheus_metrics_endpoint),
         ("Official OpenAI Python SDK Integration", test_official_openai_sdk_integration),
         ("Validation: Empty Messages", test_validation_error_empty_messages),
@@ -541,6 +849,9 @@ if __name__ == "__main__":
         ("CUDA OOM Error Semantics (503)", test_cuda_oom_error_semantics),
         ("SSE Stream Mid-Flight Error Event", test_sse_stream_error_event_mid_stream),
         ("Internal Stream Exception Metric Cleanup", test_internal_stream_exception_cleanup),
+        ("Serving Engine: Failure Before Prefill", test_serving_engine_failure_before_prefill),
+        ("Serving Engine: CUDA OOM During Prefill", test_serving_engine_cuda_oom_during_prefill),
+        ("Serving Engine: Partial Gen Accounting on Abort", test_serving_engine_partial_generation_accounting_on_abort),
         ("Async Task Cancellation Lock & Counter", test_async_task_cancellation_releases_lock_and_counter),
         ("Legacy Completion Empty Prompt Validation", test_completion_empty_prompt_validation),
     ]

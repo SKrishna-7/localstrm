@@ -8,7 +8,7 @@ performance profiling for the Mini-vLLM inference engine:
    - vllm_gpu_cache_usage_factor (KV cache physical pool saturation)
    - vllm_num_requests_running (Active concurrent batch size)
    - vllm_num_requests_waiting (Pending scheduler queue depth)
-   - vllm_prefix_cache_hit_rate (Radix deduplication efficiency)
+   - vllm_prefix_cache_hit_rate (Chained block-hash deduplication efficiency)
 
 2. Latency Distributions (p50, p90, p95, p99):
    - TTFT (Time to First Token / Prefill latency)
@@ -78,12 +78,20 @@ class EngineMetricsTracker:
         self.num_requests_running: int = 0
         self.num_requests_waiting: int = 0
         self.gpu_cache_usage_factor: float = 0.0
+        self.gpu_cache_allocated_blocks: int = 0
+        self.gpu_cache_total_blocks: int = 0
         self.prefix_cache_hit_rate: float = 0.0
 
         # Cumulative counters
         self.prompt_tokens_total: int = 0
         self.generation_tokens_total: int = 0
         self.requests_completed_total: int = 0
+        self.requests_failed_total: Dict[str, int] = {
+            "kv_cache_full": 0,
+            "cuda_oom": 0,
+            "abort": 0,
+            "error": 0,
+        }
         self.preemptions_total: int = 0
 
         # Benchmark timers
@@ -121,22 +129,34 @@ class EngineMetricsTracker:
             ["model"],
             registry=self.registry
         )
+        self.prom_gauges["gpu_cache_allocated"] = Gauge(
+            "vllm_gpu_cache_allocated_blocks",
+            "Total number of physical KV cache blocks currently allocated in pool",
+            ["model"],
+            registry=self.registry
+        )
+        self.prom_gauges["gpu_cache_total"] = Gauge(
+            "vllm_gpu_cache_total_blocks",
+            "Total capacity of physical KV cache blocks in pool",
+            ["model"],
+            registry=self.registry
+        )
         self.prom_gauges["prefix_hits"] = Gauge(
             "vllm_prefix_cache_hit_rate",
-            "Ratio of prefix tokens reused via Radix block deduplication",
+            "Ratio of prefix tokens reused via chained block-hash deduplication",
             ["model"],
             registry=self.registry
         )
 
         self.prom_counters["prompt_tokens"] = Counter(
             "vllm_prompt_tokens_total",
-            "Total number of prompt tokens processed across all requests",
+            "Total prompt tokens accounted for across requests, including reused prefix tokens and completed prefill chunks for requests that fail or are aborted",
             ["model"],
             registry=self.registry
         )
         self.prom_counters["gen_tokens"] = Counter(
             "vllm_generation_tokens_total",
-            "Total number of generation/decode tokens emitted across all requests",
+            "Total number of generation/decode tokens emitted across all requests (including tokens produced by requests that later fail or are aborted)",
             ["model"],
             registry=self.registry
         )
@@ -146,16 +166,28 @@ class EngineMetricsTracker:
             ["model"],
             registry=self.registry
         )
+        self.prom_counters["failed"] = Counter(
+            "vllm_requests_failed_total",
+            "Total number of failed or aborted inference requests categorized by error type",
+            ["model", "error_type"],
+            registry=self.registry
+        )
+        # Pre-initialize bounded error types so time-series exist in exposition
+        for etype in ("kv_cache_full", "cuda_oom", "abort", "error"):
+            self.prom_counters["failed"].labels(model=self.model_name, error_type=etype).inc(0)
+
         self.prom_counters["preemptions"] = Counter(
             "vllm_preemptions_total",
             "Total number of sequence preemptions due to memory starvation",
             ["model"],
             registry=self.registry
         )
+        for cname in ("prompt_tokens", "gen_tokens", "completed", "preemptions"):
+            self.prom_counters[cname].labels(model=self.model_name).inc(0)
 
         self.prom_histograms["ttft"] = Histogram(
             "vllm_time_to_first_token_seconds",
-            "Time to First Token (TTFT / Prefill Latency) in seconds",
+            "Time to First Token (TTFT / User-facing prefill latency including queue delay) in seconds",
             ["model"],
             buckets=[0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
             registry=self.registry
@@ -190,8 +222,12 @@ class EngineMetricsTracker:
         with self._lock:
             factor = (allocated_blocks / total_blocks) if total_blocks > 0 else 0.0
             self.gpu_cache_usage_factor = factor
+            self.gpu_cache_allocated_blocks = allocated_blocks
+            self.gpu_cache_total_blocks = total_blocks
             if self.registry:
                 self.prom_gauges["gpu_cache"].labels(model=self.model_name).set(factor)
+                self.prom_gauges["gpu_cache_allocated"].labels(model=self.model_name).set(allocated_blocks)
+                self.prom_gauges["gpu_cache_total"].labels(model=self.model_name).set(total_blocks)
 
     def record_prefix_cache_hit_rate(self, hit_tokens: int, total_prompt_tokens: int):
         with self._lock:
@@ -202,15 +238,17 @@ class EngineMetricsTracker:
 
     def record_ttft(self, latency_ms: float):
         with self._lock:
-            self.ttft_records_ms.append(latency_ms)
+            safe_lat = max(0.0, latency_ms)
+            self.ttft_records_ms.append(safe_lat)
             if self.registry:
-                self.prom_histograms["ttft"].labels(model=self.model_name).observe(latency_ms / 1000.0)
+                self.prom_histograms["ttft"].labels(model=self.model_name).observe(safe_lat / 1000.0)
 
     def record_tpot(self, latency_ms: float):
         with self._lock:
-            self.tpot_records_ms.append(latency_ms)
+            safe_lat = max(0.0, latency_ms)
+            self.tpot_records_ms.append(safe_lat)
             if self.registry:
-                self.prom_histograms["tpot"].labels(model=self.model_name).observe(latency_ms / 1000.0)
+                self.prom_histograms["tpot"].labels(model=self.model_name).observe(safe_lat / 1000.0)
 
     def record_request_completed(
         self,
@@ -219,16 +257,45 @@ class EngineMetricsTracker:
         e2e_latency_ms: float
     ):
         with self._lock:
-            self.prompt_tokens_total += prompt_tokens
-            self.generation_tokens_total += generated_tokens
+            safe_prompt = max(0, prompt_tokens)
+            safe_gen = max(0, generated_tokens)
+            safe_e2e = max(0.0, e2e_latency_ms)
+
+            self.prompt_tokens_total += safe_prompt
+            self.generation_tokens_total += safe_gen
             self.requests_completed_total += 1
-            self.e2e_records_ms.append(e2e_latency_ms)
+            self.e2e_records_ms.append(safe_e2e)
 
             if self.registry:
-                self.prom_counters["prompt_tokens"].labels(model=self.model_name).inc(prompt_tokens)
-                self.prom_counters["gen_tokens"].labels(model=self.model_name).inc(generated_tokens)
+                self.prom_counters["prompt_tokens"].labels(model=self.model_name).inc(safe_prompt)
+                self.prom_counters["gen_tokens"].labels(model=self.model_name).inc(safe_gen)
                 self.prom_counters["completed"].labels(model=self.model_name).inc(1)
-                self.prom_histograms["e2e"].labels(model=self.model_name).observe(e2e_latency_ms / 1000.0)
+                self.prom_histograms["e2e"].labels(model=self.model_name).observe(safe_e2e / 1000.0)
+
+    def record_request_failed(
+        self,
+        error_type: str = "error",
+        prompt_tokens: int = 0,
+        generated_tokens: int = 0,
+    ):
+        """Records a failed or aborted request with strictly bounded error classification.
+        Counts any prompt/generation tokens actually processed prior to failure so total GPU work
+        is accounted for in vllm_prompt_tokens_total and vllm_generation_tokens_total.
+        """
+        with self._lock:
+            safe_type = error_type if error_type in ("kv_cache_full", "cuda_oom", "abort", "error") else "error"
+            self.requests_failed_total[safe_type] = self.requests_failed_total.get(safe_type, 0) + 1
+            safe_prompt = max(0, prompt_tokens)
+            safe_gen = max(0, generated_tokens)
+            self.prompt_tokens_total += safe_prompt
+            self.generation_tokens_total += safe_gen
+
+            if self.registry:
+                self.prom_counters["failed"].labels(model=self.model_name, error_type=safe_type).inc(1)
+                if safe_prompt > 0:
+                    self.prom_counters["prompt_tokens"].labels(model=self.model_name).inc(safe_prompt)
+                if safe_gen > 0:
+                    self.prom_counters["gen_tokens"].labels(model=self.model_name).inc(safe_gen)
 
     def record_preemption(self):
         with self._lock:
@@ -255,15 +322,30 @@ class EngineMetricsTracker:
             f"# HELP vllm_gpu_cache_usage_factor Fraction of KV cache blocks allocated.",
             f"# TYPE vllm_gpu_cache_usage_factor gauge",
             f'vllm_gpu_cache_usage_factor{{model="{self.model_name}"}} {self.gpu_cache_usage_factor:.4f}',
-            f"# HELP vllm_prompt_tokens_total Total prompt tokens processed.",
+            f"# HELP vllm_gpu_cache_allocated_blocks Total number of physical KV cache blocks currently allocated in pool.",
+            f"# TYPE vllm_gpu_cache_allocated_blocks gauge",
+            f'vllm_gpu_cache_allocated_blocks{{model="{self.model_name}"}} {self.gpu_cache_allocated_blocks}',
+            f"# HELP vllm_gpu_cache_total_blocks Total capacity of physical KV cache blocks in pool.",
+            f"# TYPE vllm_gpu_cache_total_blocks gauge",
+            f'vllm_gpu_cache_total_blocks{{model="{self.model_name}"}} {self.gpu_cache_total_blocks}',
+            f"# HELP vllm_prefix_cache_hit_rate Ratio of prefix tokens reused via chained block-hash deduplication.",
+            f"# TYPE vllm_prefix_cache_hit_rate gauge",
+            f'vllm_prefix_cache_hit_rate{{model="{self.model_name}"}} {self.prefix_cache_hit_rate:.4f}',
+            f"# HELP vllm_prompt_tokens_total Total prompt tokens accounted for across requests, including reused prefix tokens and completed prefill chunks for requests that fail or are aborted.",
             f"# TYPE vllm_prompt_tokens_total counter",
             f'vllm_prompt_tokens_total{{model="{self.model_name}"}} {self.prompt_tokens_total}',
-            f"# HELP vllm_generation_tokens_total Total generation tokens produced.",
+            f"# HELP vllm_generation_tokens_total Total generation tokens emitted across all requests (including tokens produced by requests that later fail or are aborted).",
             f"# TYPE vllm_generation_tokens_total counter",
             f'vllm_generation_tokens_total{{model="{self.model_name}"}} {self.generation_tokens_total}',
             f"# HELP vllm_requests_completed_total Total requests successfully finished.",
             f"# TYPE vllm_requests_completed_total counter",
             f'vllm_requests_completed_total{{model="{self.model_name}"}} {self.requests_completed_total}',
+            f"# HELP vllm_requests_failed_total Total number of failed or aborted inference requests.",
+            f"# TYPE vllm_requests_failed_total counter",
+            *[
+                f'vllm_requests_failed_total{{error_type="{etype}",model="{self.model_name}"}} {count}'
+                for etype, count in self.requests_failed_total.items()
+            ],
             f"# HELP vllm_preemptions_total Total requests preempted.",
             f"# TYPE vllm_preemptions_total counter",
             f'vllm_preemptions_total{{model="{self.model_name}"}} {self.preemptions_total}',

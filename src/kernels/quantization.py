@@ -101,25 +101,33 @@ class QuantizedLinear(nn.Module):
 
         return qlayer
 
-    def dequantize(self) -> torch.Tensor:
+    def dequantize(self, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         """Dequantizes weights back to float on-the-fly in registers."""
         if self.quant_type == "int8":
-            return self.weight_q.float() * self.scale
+            target_dtype = dtype if dtype is not None else torch.float32
+            return self.weight_q.to(target_dtype) * self.scale.to(target_dtype)
         elif self.quant_type == "int4":
-            # Unpack two 4-bit values from uint8
-            low = (self.weight_packed & 0x0F).to(torch.int8) - 8
-            high = ((self.weight_packed >> 4) & 0x0F).to(torch.int8) - 8
-
-            # Interleave back to original shape
-            unpacked = torch.empty((self.out_features, self.in_features), dtype=torch.int8, device=self.weight_packed.device)
-            unpacked[:, 0::2] = low[:, :unpacked[:, 0::2].shape[1]]
-            unpacked[:, 1::2] = high[:, :unpacked[:, 1::2].shape[1]]
-            return unpacked.float() * self.scale
+            target_dtype = dtype if dtype is not None else torch.float32
+            # Interleave back to original shape directly into slices to avoid
+            # allocating separate low and high temporary tensors.
+            unpacked = torch.empty(
+                (self.out_features, self.in_features),
+                dtype=torch.int8,
+                device=self.weight_packed.device
+            )
+            even_cols = unpacked[:, 0::2].shape[1]
+            odd_cols = unpacked[:, 1::2].shape[1]
+            unpacked[:, 0::2] = (self.weight_packed[:, :even_cols] & 0x0F).to(torch.int8) - 8
+            unpacked[:, 1::2] = ((self.weight_packed[:, :odd_cols] >> 4) & 0x0F).to(torch.int8) - 8
+            return unpacked.to(target_dtype) * self.scale.to(target_dtype)
         else:
-            return self.weight
+            w = self.weight
+            if dtype is not None and w.dtype != dtype:
+                w = w.to(dtype)
+            return w
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w_float = self.dequantize()
+        w_float = self.dequantize(dtype=x.dtype)
         if w_float.device != x.device:
             w_float = w_float.to(x.device)
         if w_float.dtype != x.dtype:
@@ -247,8 +255,10 @@ class CachedQuantizedLinear(nn.Module):
         layer.to(weight_q.device)
         return layer
 
-    def dequantize(self) -> torch.Tensor:
+    def dequantize(self, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         """Returns pre-cached weights."""
+        if dtype is not None and self.weight.dtype != dtype:
+            return self.weight.to(dtype)
         return self.weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -473,6 +483,7 @@ def apply_optional_quantization(model: nn.Module, quant_type: str = "none") -> T
     elif hasattr(model, "layers"):
         layers = model.layers
 
+    quantized_layers_count = 0
     if layers is not None:
         for layer in layers:
             if hasattr(layer, "self_attn"):
@@ -483,6 +494,7 @@ def apply_optional_quantization(model: nn.Module, quant_type: str = "none") -> T
                             setattr(layer.self_attn, proj, CachedQuantizedLinear.from_float(linear_mod))
                         else:
                             setattr(layer.self_attn, proj, QuantizedLinear.from_float(linear_mod, quant_type))
+                        quantized_layers_count += 1
             if hasattr(layer, "mlp"):
                 for proj in ("gate_proj", "up_proj", "down_proj"):
                     linear_mod = getattr(layer.mlp, proj, None)
@@ -499,6 +511,15 @@ def apply_optional_quantization(model: nn.Module, quant_type: str = "none") -> T
                                 setattr(layer.mlp, proj, QuantizedLinear.from_float(linear_mod, quant_type="int8"))
                         else:
                             setattr(layer.mlp, proj, QuantizedLinear.from_float(linear_mod, quant_type))
+                        quantized_layers_count += 1
+
+    if quant_type != "none" and quantized_layers_count == 0:
+        raise ValueError(
+            f"Quantization '{quant_type}' failed: no compatible linear layers found in model "
+            f"architecture ({model.__class__.__name__}). Supported architectures require transformer "
+            f"blocks with standard self_attn (q, k, v, o) and mlp (gate, up, down) projections "
+            f"(e.g., LLaMA, Qwen2, Mistral)."
+        )
 
     quant_bytes = 0
     for m in model.modules():
@@ -516,7 +537,8 @@ def load_and_quantize_model(
     device: Union[torch.device, str],
     quantization: str = "none",
     dtype: Optional[torch.dtype] = None,
-    logger: Optional[Any] = None
+    logger: Optional[Any] = None,
+    trust_remote_code: bool = False
 ) -> Tuple[nn.Module, int, int]:
     """
     Loads a Hugging Face CausalLM model with support for CPU-staged quantization.
@@ -572,9 +594,9 @@ def load_and_quantize_model(
             if log_fn:
                 log_fn("Staging uncompressed model on CPU before applying %s quantization...", quantization.upper())
             try:
-                model = AutoModelForCausalLM.from_pretrained(model_name_or_path, dtype=dtype).to("cpu")
+                model = AutoModelForCausalLM.from_pretrained(model_name_or_path, dtype=dtype, trust_remote_code=trust_remote_code).to("cpu")
             except TypeError:
-                model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=dtype).to("cpu")
+                model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=dtype, trust_remote_code=trust_remote_code).to("cpu")
             model.eval()
 
             if log_fn:
@@ -588,9 +610,9 @@ def load_and_quantize_model(
             model = model.to(device)
         else:
             try:
-                model = AutoModelForCausalLM.from_pretrained(model_name_or_path, dtype=dtype).to(device)
+                model = AutoModelForCausalLM.from_pretrained(model_name_or_path, dtype=dtype, trust_remote_code=trust_remote_code).to(device)
             except TypeError:
-                model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=dtype).to(device)
+                model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=dtype, trust_remote_code=trust_remote_code).to(device)
             model.eval()
 
             if quantization != "none":

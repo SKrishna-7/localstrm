@@ -174,10 +174,18 @@ def test_cli_parser_default_engine_selection():
     assert args.total_blocks is None
     assert args.vram_budget is None
     assert args.kv_cache_dtype == "fp16"
+    assert args.host == "127.0.0.1"
+
+
+def test_cli_parser_serve_default_host():
+    """Validates that cli.py serve defaults to localhost (127.0.0.1) for security."""
+    parser = build_parser()
+    args = parser.parse_args(["serve"])
+    assert args.host == "127.0.0.1"
 
 
 def test_cli_parser_explicit_minivllm_selection():
-    """2. Validates explicit --engine mini-vllm selection and parameter parsing."""
+    """2. Validates legacy --engine mini-vllm selection and parameter parsing."""
     parser = build_parser()
     args = parser.parse_args([
         "serve",
@@ -194,12 +202,38 @@ def test_cli_parser_explicit_minivllm_selection():
     assert args.vram_budget is None
 
 
+def test_cli_parser_explicit_localstrm_selection():
+    """Validates canonical --engine localstrm selection and parameter parsing."""
+    parser = build_parser()
+    args = parser.parse_args([
+        "serve",
+        "--engine", "localstrm",
+        "--batch-size", "8",
+        "--kv-cache-dtype", "int8",
+        "--total-blocks", "128"
+    ])
+    assert args.subcommand == "serve"
+    assert args.engine == "localstrm"
+    assert args.batch_size == 8
+    assert args.kv_cache_dtype == "int8"
+    assert args.total_blocks == 128
+    assert args.vram_budget is None
+
+
+def test_cli_parser_invalid_engine_rejected(capsys):
+    """Validates that invalid --engine values are rejected by the parser with a useful error."""
+    parser = build_parser()
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["serve", "--engine", "unsupported-engine"])
+    assert exc_info.value.code == 2
+
+
 def test_cli_parser_vram_budget_parsing():
     """3. Validates that --vram-budget parses correctly."""
     parser = build_parser()
     args = parser.parse_args([
         "serve",
-        "--engine", "mini-vllm",
+        "--engine", "localstrm",
         "--vram-budget", "3.5GiB"
     ])
     assert args.vram_budget == "3.5GiB"
@@ -211,7 +245,7 @@ def test_cmd_serve_mutually_exclusive_blocks_and_budget_fails():
     parser = build_parser()
     args = parser.parse_args([
         "serve",
-        "--engine", "mini-vllm",
+        "--engine", "localstrm",
         "--total-blocks", "64",
         "--vram-budget", "2GiB"
     ])
@@ -223,7 +257,7 @@ def test_cmd_serve_mutually_exclusive_blocks_and_budget_fails():
 
 
 def test_cmd_serve_hf_ignores_minivllm_flags_with_warning(capsys):
-    """5. Validates warning printed when mini-vllm flags are passed with default hf engine."""
+    """5. Validates warning printed when LocalStrm flags are passed with default hf engine."""
     parser = build_parser()
     args = parser.parse_args([
         "serve",
@@ -253,16 +287,47 @@ def test_cmd_serve_initializes_selected_backend_only():
         cmd_serve(args_hf)
         mock_hf_engine.assert_called_once()
 
-    # Case B: 'mini-vllm' engine
+    # Case B: Legacy alias 'mini-vllm' engine
     args_mvllm = parser.parse_args(["serve", "--engine", "mini-vllm"])
     with patch("src.memory.preflight.enforce_preflight_check"), \
-         patch("src.engine.llm_engine.MiniVLLMEngine") as mock_core, \
-         patch("src.server.serving_adapter.AsyncServingAdapter") as mock_adapter, \
+         patch("src.engine.llm_engine.MiniVLLMEngine") as mock_core_mv, \
+         patch("src.server.serving_adapter.AsyncServingAdapter") as mock_adapter_mv, \
          patch("src.server.app.create_app"), \
          patch("uvicorn.run"):
         cmd_serve(args_mvllm)
-        mock_core.assert_called_once()
-        mock_adapter.assert_called_once()
+        mock_core_mv.assert_called_once()
+        mock_adapter_mv.assert_called_once()
+
+    # Case C: Canonical 'localstrm' engine
+    args_localstrm = parser.parse_args(["serve", "--engine", "localstrm"])
+    with patch("src.memory.preflight.enforce_preflight_check"), \
+         patch("src.engine.llm_engine.MiniVLLMEngine") as mock_core_ls, \
+         patch("src.server.serving_adapter.AsyncServingAdapter") as mock_adapter_ls, \
+         patch("src.server.app.create_app"), \
+         patch("uvicorn.run"):
+        cmd_serve(args_localstrm)
+        mock_core_ls.assert_called_once()
+        mock_adapter_ls.assert_called_once()
+
+
+def test_cmd_serve_unsupported_engine_exits_code_2(capsys):
+    """Validates that cmd_serve exits with code 2 if an unknown engine is provided."""
+    import argparse
+    args = argparse.Namespace(
+        model="Qwen/Qwen2.5-0.5B",
+        device="cpu",
+        quant="none",
+        host="127.0.0.1",
+        port=8000,
+        engine="completely_unknown_engine",
+        verbose=False
+    )
+    with patch("src.memory.preflight.enforce_preflight_check"):
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_serve(args)
+        assert exc_info.value.code == 2
+    captured = capsys.readouterr().out
+    assert "Unsupported engine 'completely_unknown_engine'" in captured
 
 
 # =============================================================================

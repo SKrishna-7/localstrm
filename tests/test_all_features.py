@@ -5,7 +5,7 @@ Validates all core architectural features and subsystems:
   1. Pre-Flight Hardware & Memory Guard
   2. Virtual Memory Paged Block Manager
   3. PagedAttention Gathered Attention Kernel (Numerical Equivalence)
-  4. Content-Addressed Radix Prefix Caching & Block Deduplication
+  4. Content-Addressed Chained Block-Hash Prefix Caching & Block Deduplication
   5. Memory Starvation Preemption & Recovery
   6. Weight Quantization (INT8 & Bit-Packed INT4 Nibbles)
   7. Chunked Prefill Scheduler (Prompt Slicing & SLA Protection)

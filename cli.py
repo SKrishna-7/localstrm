@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore")
 
 import argparse
 import time
-from typing import List, Optional
+from typing import List, Optional, Set, Any, Dict
 
 # Add project root to sys.path so src imports resolve cleanly
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
@@ -68,7 +68,11 @@ def print_banner():
 def cmd_inspect(args):
     """Subcommand: Inspect model architecture, parameter weights, and VRAM budget."""
     from benchmarks.inspect_model import inspect_model_memory
-    inspect_model_memory(model_name=args.model, device=args.device)
+    inspect_model_memory(
+        model_name=args.model,
+        device=args.device,
+        trust_remote_code=getattr(args, "trust_remote_code", False)
+    )
 
 
 def cmd_benchmark(args):
@@ -79,7 +83,8 @@ def cmd_benchmark(args):
     enforce_preflight_check(
         args.model,
         device=args.device,
-        force=getattr(args, "force", False)
+        force=getattr(args, "force", False),
+        trust_remote_code=getattr(args, "trust_remote_code", False)
     )
 
     prompts = args.prompt
@@ -122,7 +127,8 @@ def cmd_engine(args):
         args.model,
         device=args.device,
         quantization=args.quant,
-        force=getattr(args, "force", False)
+        force=getattr(args, "force", False),
+        trust_remote_code=getattr(args, "trust_remote_code", False)
     )
 
     prompts = args.prompt
@@ -481,9 +487,12 @@ def cmd_serve(args):
         force=getattr(args, "force", False)
     )
 
-    serving_engine_type = getattr(args, "engine", "hf").lower()
-
+    raw_engine = getattr(args, "engine", "hf")
+    serving_engine_type = raw_engine.lower() if isinstance(raw_engine, str) else "hf"
     if serving_engine_type in ("mini-vllm", "minivllm"):
+        serving_engine_type = "localstrm"
+
+    if serving_engine_type == "localstrm":
         total_blocks = getattr(args, "total_blocks", None)
         vram_budget = getattr(args, "vram_budget", None)
         if total_blocks is not None and vram_budget is not None:
@@ -491,23 +500,26 @@ def cmd_serve(args):
                   f"and --vram-budget ({vram_budget!r}) were provided. "
                   f"Specify --total-blocks OR --vram-budget, not both.{Colors.RESET}")
             sys.exit(2)
-    else:
+    elif serving_engine_type == "hf":
         total_blocks = getattr(args, "total_blocks", None)
         vram_budget = getattr(args, "vram_budget", None)
         kv_dtype = getattr(args, "kv_cache_dtype", "fp16")
         if total_blocks is not None or vram_budget is not None or kv_dtype != "fp16":
             print(f"{Colors.YELLOW}Warning: Options --total-blocks, --vram-budget, and --kv-cache-dtype are only applicable "
-                  f"when --engine mini-vllm is selected. Ignoring for Hugging Face engine.{Colors.RESET}")
+                  f"when --engine localstrm is selected. Ignoring for Hugging Face engine.{Colors.RESET}")
+    else:
+        print(f"{Colors.RED}Error: Unsupported engine '{args.engine}'. Supported engines are 'localstrm' (or legacy alias 'mini-vllm') and 'hf'.{Colors.RESET}")
+        sys.exit(2)
 
     print_banner()
     print(f"{Colors.BOLD}{Colors.CYAN}Starting OpenAI-Compatible Inference Server...{Colors.RESET}")
-    print(f"  Engine:       {Colors.GREEN}{'Mini-vLLM (PagedAttention + Continuous Batching)' if serving_engine_type in ('mini-vllm', 'minivllm') else 'Hugging Face (Serial)'}{Colors.RESET}")
+    print(f"  Engine:       {Colors.GREEN}{'LocalStrm (PagedAttention + Continuous Batching)' if serving_engine_type == 'localstrm' else 'Hugging Face (Serial)'}{Colors.RESET}")
     print(f"  Model:        {Colors.GREEN}{args.model}{Colors.RESET}")
     print(f"  Device:       {Colors.GREEN}{args.device}{Colors.RESET}")
     print(f"  Quantization: {Colors.GREEN}{args.quant}{Colors.RESET}")
     print(f"  Host:         {Colors.GREEN}{args.host}{Colors.RESET}")
     print(f"  Port:         {Colors.GREEN}{args.port}{Colors.RESET}")
-    if serving_engine_type in ("mini-vllm", "minivllm"):
+    if serving_engine_type == "localstrm":
         print(f"  KV Cache:     {Colors.GREEN}{getattr(args, 'kv_cache_dtype', 'fp16').upper()}{Colors.RESET}")
         if getattr(args, 'vram_budget', None):
             print(f"  VRAM Budget:  {Colors.GREEN}{args.vram_budget}{Colors.RESET}")
@@ -520,7 +532,7 @@ def cmd_serve(args):
     print(f"{Colors.DIM}Models List:    http://{args.host}:{args.port}/v1/models{Colors.RESET}")
     print(f"{Colors.DIM}Metrics:        http://{args.host}:{args.port}/metrics{Colors.RESET}\n")
 
-    if serving_engine_type in ("mini-vllm", "minivllm"):
+    if serving_engine_type == "localstrm":
         from src.engine.llm_engine import MiniVLLMEngine
         from src.server.serving_adapter import AsyncServingAdapter
 
@@ -532,7 +544,8 @@ def cmd_serve(args):
             device=args.device,
             quantization=args.quant,
             kv_cache_dtype=getattr(args, "kv_cache_dtype", "fp16"),
-            verbose=args.verbose
+            verbose=args.verbose,
+            trust_remote_code=getattr(args, "trust_remote_code", False)
         )
         engine = AsyncServingAdapter(core_engine)
     else:
@@ -542,7 +555,8 @@ def cmd_serve(args):
             model_name=args.model,
             device=args.device,
             quantization=args.quant,
-            force=getattr(args, "force", False)
+            force=getattr(args, "force", False),
+            trust_remote_code=getattr(args, "trust_remote_code", False)
         )
 
     app = create_app(engine)
@@ -576,24 +590,90 @@ def cmd_serve(args):
 
 
 
-def cmd_chat(args):
-    """Subcommand: Interactive streaming chat REPL with optional quantization and live metrics."""
+def get_stopping_criteria_token_ids(tokenizer: Any, model: Optional[Any] = None) -> Set[int]:
+    """
+    Extracts all valid end-of-sequence / stop token IDs for generation.
+    Safely verifies that candidate special tokens actually exist in the tokenizer
+    vocabulary and cannot accidentally alias unknown-token IDs, pad IDs, or unmapped tokens.
+    """
+    stop_token_ids = set()
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        if isinstance(tokenizer.eos_token_id, list):
+            stop_token_ids.update(tokenizer.eos_token_id)
+        else:
+            stop_token_ids.add(tokenizer.eos_token_id)
+
+    gen_config = getattr(model, "generation_config", None) if model is not None else None
+    if gen_config is not None and getattr(gen_config, "eos_token_id", None) is not None:
+        cfg_eos = gen_config.eos_token_id
+        if isinstance(cfg_eos, list):
+            stop_token_ids.update(cfg_eos)
+        elif isinstance(cfg_eos, int):
+            stop_token_ids.add(cfg_eos)
+
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else None
+
+    for end_tok in ("<|im_end|>", "<|eot_id|>", "</s>"):
+        try:
+            if vocab is not None:
+                if end_tok in vocab:
+                    tid = vocab[end_tok]
+                    if isinstance(tid, int) and tid != unk_id and tid != pad_id and tid >= 0:
+                        stop_token_ids.add(tid)
+            else:
+                tid = tokenizer.convert_tokens_to_ids(end_tok)
+                if isinstance(tid, int) and tid != unk_id and tid != pad_id and tid >= 0:
+                    decoded = tokenizer.decode([tid], skip_special_tokens=False).strip()
+                    if decoded == end_tok:
+                        stop_token_ids.add(tid)
+        except Exception:
+            pass
+
+    return stop_token_ids
+
+
+def format_chat_prompt(conversation_history: List[Dict[str, str]], tokenizer: Any) -> str:
+    """Formats multi-turn conversation history using tokenizer chat template or standard multi-turn fallback."""
+    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None) is not None:
+        return tokenizer.apply_chat_template(conversation_history, tokenize=False, add_generation_prompt=True)
+
+    parts = []
+    for msg in conversation_history:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "system":
+            parts.append(f"System: {content}")
+        elif role == "assistant":
+            parts.append(f"Assistant: {content}")
+        else:
+            parts.append(f"User: {content}")
+    parts.append("Assistant: ")
+    return "\n".join(parts)
+
+
+def _run_chat_hf(args):
+    """Interactive streaming chat REPL powered by Hugging Face sequential decode."""
     from src.memory.preflight import enforce_preflight_check
 
     device_str = args.device or get_default_device()
     device = torch.device(device_str)
 
+    trust_remote = getattr(args, "trust_remote_code", False)
     enforce_preflight_check(
         args.model,
         device=device_str,
         quantization=args.quant,
-        force=getattr(args, "force", False)
+        force=getattr(args, "force", False),
+        trust_remote_code=trust_remote
     )
 
     print_banner()
 
     print(f"{Colors.BOLD}Device:{Colors.RESET}        {device.type.upper()}")
     print(f"{Colors.BOLD}Model:{Colors.RESET}         {args.model}")
+    print(f"{Colors.BOLD}Engine:{Colors.RESET}        Hugging Face (Serial)")
     print(f"{Colors.BOLD}Quantization:{Colors.RESET}  {args.quant.upper()}")
     print(f"{Colors.BOLD}Max Tokens:{Colors.RESET}    {args.max_tokens}")
     print(f"{Colors.BOLD}Temperature:{Colors.RESET}   {args.temperature}")
@@ -602,20 +682,28 @@ def cmd_chat(args):
     # 1. Load Tokenizer & Model (with CPU-staged quantization if enabled)
     print(f"{Colors.YELLOW}Loading model weights...{Colors.RESET}", end="", flush=True)
     t0 = time.perf_counter()
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=trust_remote)
     dtype = torch.float32 if device.type == "cpu" else torch.float16
     model, orig_bytes, quant_bytes = load_and_quantize_model(
         args.model,
         device=device,
         quantization=args.quant,
-        dtype=dtype
+        dtype=dtype,
+        trust_remote_code=trust_remote
     )
     load_time = time.perf_counter() - t0
     print(f" {Colors.GREEN}Ready! ({load_time:.2f}s){Colors.RESET}")
 
+    is_chat_model = any(k in args.model.lower() for k in ("instruct", "chat", "it", "conversational"))
+    if not is_chat_model:
+        print(f" {Colors.YELLOW}[Notice] '{args.model}' appears to be a base completion model, not instruction-tuned (e.g. '*-Instruct'). Interactive chat responses may produce code/text completion rather than conversation.{Colors.RESET}")
+
     if args.quant != "none":
         savings = (1.0 - (quant_bytes / orig_bytes)) * 100 if orig_bytes > 0 else 0.0
         print(f" {Colors.GREEN}Applied {args.quant.upper()} quantization ({savings:.1f}% VRAM freed){Colors.RESET}")
+
+    # Build comprehensive set of stop token IDs (handles single int, list of ints, and verified template end tokens)
+    stop_token_ids = get_stopping_criteria_token_ids(tokenizer, model)
 
     print(f"\n{Colors.GREEN}{Colors.BOLD}● Engine online! Type your message below:{Colors.RESET}\n")
 
@@ -656,11 +744,8 @@ def cmd_chat(args):
         # Append to history
         conversation_history.append({"role": "user", "content": user_input})
 
-        # Format input using model chat template if available, else standard fallback
-        if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
-            prompt_text = tokenizer.apply_chat_template(conversation_history, tokenize=False, add_generation_prompt=True)
-        else:
-            prompt_text = f"User: {user_input}\nAssistant: "
+        # Format input using model chat template if available, else standard multi-turn fallback
+        prompt_text = format_chat_prompt(conversation_history, tokenizer)
 
         input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(device)
         prompt_len = input_ids.shape[1]
@@ -678,44 +763,47 @@ def cmd_chat(args):
 
         past_key_values = outputs.past_key_values
         next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        first_token_val = next_token_id.item()
 
-        first_token_str = tokenizer.decode(next_token_id[0], skip_special_tokens=True)
-        sys.stdout.write(first_token_str)
-        sys.stdout.flush()
-
-        generated_ids = [next_token_id.item()]
+        generated_ids = [first_token_val]
         decode_times = []
         curr_token = next_token_id
 
-        # Decode token-by-token with streaming
-        for _ in range(1, args.max_tokens):
-            t_step_start = time.perf_counter()
-            with torch.no_grad():
-                outputs = model(curr_token, past_key_values=past_key_values, use_cache=True)
-            t_step_end = time.perf_counter()
-            decode_times.append((t_step_end - t_step_start) * 1000)
-
-            past_key_values = outputs.past_key_values
-
-            # Sampling with temperature
-            if args.temperature > 0.0:
-                logits = outputs.logits[:, -1, :] / args.temperature
-                probs = F.softmax(logits, dim=-1)
-                curr_token = torch.multinomial(probs, num_samples=1)
-            else:
-                curr_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-
-            token_id = curr_token.item()
-            generated_ids.append(token_id)
-
-            if token_id == tokenizer.eos_token_id:
-                break
-
-            token_str = tokenizer.decode([token_id], skip_special_tokens=True)
-            sys.stdout.write(token_str)
+        if first_token_val not in stop_token_ids:
+            first_token_str = tokenizer.decode(next_token_id[0], skip_special_tokens=True)
+            sys.stdout.write(first_token_str)
             sys.stdout.flush()
 
-        assistant_reply = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            # Decode token-by-token with streaming
+            for _ in range(1, args.max_tokens):
+                t_step_start = time.perf_counter()
+                with torch.no_grad():
+                    outputs = model(curr_token, past_key_values=past_key_values, use_cache=True)
+                t_step_end = time.perf_counter()
+                decode_times.append((t_step_end - t_step_start) * 1000)
+
+                past_key_values = outputs.past_key_values
+
+                # Sampling with temperature
+                if args.temperature > 0.0:
+                    logits = outputs.logits[:, -1, :] / args.temperature
+                    probs = F.softmax(logits, dim=-1)
+                    curr_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    curr_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+
+                token_id = curr_token.item()
+                generated_ids.append(token_id)
+
+                if token_id in stop_token_ids:
+                    break
+
+                token_str = tokenizer.decode([token_id], skip_special_tokens=True)
+                sys.stdout.write(token_str)
+                sys.stdout.flush()
+
+        clean_ids = [t for t in generated_ids if t not in stop_token_ids]
+        assistant_reply = tokenizer.decode(clean_ids, skip_special_tokens=True)
         conversation_history.append({"role": "assistant", "content": assistant_reply})
 
         # Calculate metrics
@@ -728,6 +816,201 @@ def cmd_chat(args):
         print(f"│ ⚡ TTFT: {ttft:6.1f} ms  │  Avg TPOT: {avg_tpot:5.1f} ms/tok  │  Speed: {throughput:5.1f} tok/s  │")
         print(f"│ 📊 Tokens: {len(generated_ids):4d}   │  Prompt: {prompt_len:4d} tokens   │  Quant: {args.quant.upper():4s}       │")
         print(f"└──────────────────────────────────────────────────────────────┘{Colors.RESET}\n")
+
+
+def _run_chat_localstrm(args):
+    """Interactive streaming chat REPL powered by LocalStrm MiniVLLMEngine (PagedAttention)."""
+    from src.memory.preflight import enforce_preflight_check
+    from src.engine.llm_engine import MiniVLLMEngine, RequestStatus
+    from src.engine.sampling import SamplingParams
+
+    device_str = args.device or get_default_device()
+    device = torch.device(device_str)
+
+    trust_remote = getattr(args, "trust_remote_code", False)
+    enforce_preflight_check(
+        args.model,
+        device=device_str,
+        quantization=getattr(args, "quant", "none"),
+        force=getattr(args, "force", False),
+        trust_remote_code=trust_remote
+    )
+
+    print_banner()
+
+    print(f"{Colors.BOLD}Device:{Colors.RESET}        {device.type.upper()}")
+    print(f"{Colors.BOLD}Model:{Colors.RESET}         {args.model}")
+    print(f"{Colors.BOLD}Engine:{Colors.RESET}        LocalStrm (PagedAttention + Continuous Batching)")
+    print(f"{Colors.BOLD}Quantization:{Colors.RESET}  {args.quant.upper()}")
+    print(f"{Colors.BOLD}Max Tokens:{Colors.RESET}    {args.max_tokens}")
+    print(f"{Colors.BOLD}Temperature:{Colors.RESET}   {args.temperature}")
+    kv_dtype = getattr(args, "kv_cache_dtype", "fp16")
+    print(f"{Colors.BOLD}KV Cache:{Colors.RESET}      {kv_dtype.upper()}")
+    if getattr(args, "vram_budget", None):
+        print(f"{Colors.BOLD}VRAM Budget:{Colors.RESET}   {args.vram_budget}")
+    elif getattr(args, "total_blocks", None):
+        print(f"{Colors.BOLD}KV Blocks:{Colors.RESET}     {args.total_blocks}")
+    print(f"{Colors.DIM}Commands: /clear (reset history), /stats (memory info), /exit (quit){Colors.RESET}\n")
+
+    print(f"{Colors.YELLOW}Loading LocalStrm engine...{Colors.RESET}", end="", flush=True)
+    t0 = time.perf_counter()
+
+    # Note: MiniVLLMEngine validates model architecture and fails closed with a clear
+    # ValueError if the architecture is incompatible with PagedAttention / standard transformer blocks.
+    engine = MiniVLLMEngine(
+        model_name=args.model,
+        max_batch_size=getattr(args, "batch_size", 4),
+        total_blocks=getattr(args, "total_blocks", None),
+        vram_budget=getattr(args, "vram_budget", None),
+        device=device_str,
+        quantization=getattr(args, "quant", "none"),
+        kv_cache_dtype=getattr(args, "kv_cache_dtype", "fp16"),
+        verbose=getattr(args, "verbose", False),
+        trust_remote_code=trust_remote
+    )
+    load_time = time.perf_counter() - t0
+    print(f" {Colors.GREEN}Ready! ({load_time:.2f}s){Colors.RESET}")
+
+    tokenizer = engine.tokenizer
+    model = engine.model
+
+    is_chat_model = any(k in args.model.lower() for k in ("instruct", "chat", "it", "conversational"))
+    if not is_chat_model:
+        print(f" {Colors.YELLOW}[Notice] '{args.model}' appears to be a base completion model, not instruction-tuned (e.g. '*-Instruct'). Interactive chat responses may produce code/text completion rather than conversation.{Colors.RESET}")
+
+    stop_token_ids = get_stopping_criteria_token_ids(tokenizer, model)
+
+    print(f"\n{Colors.GREEN}{Colors.BOLD}● Engine online! Type your message below:{Colors.RESET}\n")
+
+    conversation_history = []
+    if getattr(args, "system", None):
+        conversation_history.append({"role": "system", "content": args.system})
+
+    while True:
+        try:
+            user_input = input(f"{Colors.BOLD}{Colors.BLUE}You > {Colors.RESET}").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting LocalStrm CLI. Goodbye!")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.lower() in ["/exit", "/quit", ":q"]:
+            print("Exiting LocalStrm CLI. Goodbye!")
+            break
+        elif user_input.lower() == "/clear":
+            conversation_history.clear()
+            if getattr(args, "system", None):
+                conversation_history.append({"role": "system", "content": args.system})
+            print(f"{Colors.DIM}Conversation history cleared.{Colors.RESET}")
+            continue
+        elif user_input.lower() == "/stats":
+            if device.type == "cuda":
+                alloc = torch.cuda.memory_allocated() / (1024**2)
+                res = torch.cuda.memory_reserved() / (1024**2)
+                print(f"{Colors.DIM}[VRAM Stats] Allocated: {alloc:.1f} MB | Reserved: {res:.1f} MB{Colors.RESET}")
+            else:
+                print(f"{Colors.DIM}[Engine Stats] Running on CPU{Colors.RESET}")
+            free_b = engine.num_free_blocks
+            tot_b = engine.total_blocks
+            print(f"{Colors.DIM}[KV Cache Pool] Free blocks: {free_b}/{tot_b} ({(free_b/tot_b)*100:.1f}% free){Colors.RESET}")
+            continue
+
+        conversation_history.append({"role": "user", "content": user_input})
+
+        prompt_text = format_chat_prompt(conversation_history, tokenizer)
+
+        sampling_params = SamplingParams(
+            temperature=getattr(args, "temperature", 0.7),
+            top_p=getattr(args, "top_p", 1.0),
+            top_k=getattr(args, "top_k", -1),
+            min_p=getattr(args, "min_p", 0.0),
+            repetition_penalty=getattr(args, "repetition_penalty", 1.0),
+            stop_token_ids=list(stop_token_ids),
+        )
+
+        req = engine.add_request(
+            prompt=prompt_text,
+            max_tokens=args.max_tokens,
+            arrival_step=engine.current_step,
+            sampling_params=sampling_params
+        )
+
+        prompt_len = len(req.prompt_token_ids)
+        print(f"\n{Colors.BOLD}{Colors.GREEN}LocalStrm > {Colors.RESET}", end="", flush=True)
+
+        num_emitted = 0
+        decode_times = []
+        t_step_start = time.perf_counter()
+
+        while True:
+            active = engine.step()
+            t_step_end = time.perf_counter()
+            step_duration_ms = (t_step_end - t_step_start) * 1000
+
+            if len(req.output_token_ids) > num_emitted:
+                if num_emitted > 0:
+                    decode_times.append(step_duration_ms)
+                new_tokens = req.output_token_ids[num_emitted:]
+                for tok_id in new_tokens:
+                    if tok_id not in stop_token_ids:
+                        token_str = tokenizer.decode([tok_id], skip_special_tokens=True)
+                        sys.stdout.write(token_str)
+                        sys.stdout.flush()
+                num_emitted = len(req.output_token_ids)
+
+            t_step_start = time.perf_counter()
+
+            if req.status in (RequestStatus.FINISHED, RequestStatus.FAILED):
+                break
+            if not active:
+                break
+
+        if req.status == RequestStatus.FAILED:
+            print(f"\n{Colors.RED}Generation failed: {req.error or req.stop_reason}{Colors.RESET}")
+
+        clean_ids = [t for t in req.output_token_ids if t not in stop_token_ids]
+        assistant_reply = tokenizer.decode(clean_ids, skip_special_tokens=True)
+        conversation_history.append({"role": "assistant", "content": assistant_reply})
+
+        ttft = req.ttft_ms if req.ttft_ms is not None else 0.0
+        avg_tpot = sum(decode_times) / len(decode_times) if decode_times else 0.0
+        total_gen_time = sum(decode_times) / 1000
+        throughput = len(decode_times) / total_gen_time if total_gen_time > 0 else 0.0
+
+        print(f"\n\n{Colors.DIM}┌──────────────────────────────────────────────────────────────┐")
+        print(f"│ ⚡ TTFT: {ttft:6.1f} ms  │  Avg TPOT: {avg_tpot:5.1f} ms/tok  │  Speed: {throughput:5.1f} tok/s  │")
+        print(f"│ 📊 Tokens: {len(req.output_token_ids):4d}   │  Prompt: {prompt_len:4d} tokens   │  Quant: {getattr(args, 'quant', 'none').upper():4s}       │")
+        print(f"└──────────────────────────────────────────────────────────────┘{Colors.RESET}\n")
+
+
+def cmd_chat(args):
+    """Subcommand: Interactive streaming chat REPL with selectable LocalStrm or Hugging Face engine."""
+    engine_type = (getattr(args, "engine", "hf") or "hf").lower()
+    if engine_type in ("mini-vllm", "minivllm"):
+        engine_type = "localstrm"
+
+    if engine_type == "localstrm":
+        total_blocks = getattr(args, "total_blocks", None)
+        vram_budget = getattr(args, "vram_budget", None)
+        if total_blocks is not None and vram_budget is not None:
+            print(f"{Colors.RED}Error: Conflicting KV-cache options: both --total-blocks ({total_blocks}) "
+                  f"and --vram-budget ({vram_budget!r}) were provided. "
+                  f"Specify --total-blocks OR --vram-budget, not both.{Colors.RESET}")
+            sys.exit(2)
+        _run_chat_localstrm(args)
+    elif engine_type == "hf":
+        total_blocks = getattr(args, "total_blocks", None)
+        vram_budget = getattr(args, "vram_budget", None)
+        kv_dtype = getattr(args, "kv_cache_dtype", "fp16")
+        if total_blocks is not None or vram_budget is not None or kv_dtype != "fp16":
+            print(f"{Colors.YELLOW}Warning: Options --total-blocks, --vram-budget, and --kv-cache-dtype are only applicable "
+                  f"when --engine localstrm is selected. Ignoring for Hugging Face engine.{Colors.RESET}")
+        _run_chat_hf(args)
+    else:
+        print(f"{Colors.RED}Error: Unsupported engine '{args.engine}'. Supported engines are 'localstrm' (or legacy alias 'mini-vllm') and 'hf'.{Colors.RESET}")
+        sys.exit(2)
 
 
 def build_parent_parser() -> argparse.ArgumentParser:
@@ -757,6 +1040,12 @@ def build_parent_parser() -> argparse.ArgumentParser:
         help="Bypass pre-flight system memory and hardware capacity check"
     )
     parent.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        default=False,
+        help="Allow executing custom modeling code defined in HuggingFace model repositories (default: False)"
+    )
+    parent.add_argument(
         "-l", "--list-models", "--models",
         action="store_true",
         dest="list_models",
@@ -782,6 +1071,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser_chat.add_argument("--max-tokens", type=int, default=128, help="Maximum new tokens per response")
     parser_chat.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (0.0 = greedy)")
     parser_chat.add_argument("--system", type=str, default=None, help="Custom system prompt")
+    parser_chat.add_argument(
+        "--engine",
+        type=str,
+        choices=["hf", "localstrm", "mini-vllm"],
+        default="hf",
+        help="Chat engine backend: 'localstrm' (LocalStrm PagedAttention continuous batching engine; legacy alias: 'mini-vllm') or 'hf' (default: Hugging Face serial engine)"
+    )
+    parser_chat.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="Maximum continuous batch capacity for LocalStrm engine (default: 4)"
+    )
+    parser_chat.add_argument(
+        "--total-blocks",
+        type=int,
+        default=None,
+        help="Total physical KV cache blocks in pool for LocalStrm engine"
+    )
+    parser_chat.add_argument(
+        "--vram-budget",
+        type=str,
+        default=None,
+        help="Total engine VRAM operational budget ceiling (e.g. '2GiB', '1400MiB') for LocalStrm engine"
+    )
+    parser_chat.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        choices=["fp16", "int8"],
+        default="fp16",
+        help="KV cache storage dtype for LocalStrm engine (default: fp16, int8 cuts KV memory by 50%%)"
+    )
 
     # Subcommand: engine
     parser_engine = subparsers.add_parser("engine", parents=[parent_parser], help="Run unified PagedAttention + Continuous Batching engine")
@@ -793,8 +1114,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser_engine.add_argument("--block-size", type=int, default=16, help="Tokens per physical block")
     parser_engine.add_argument("--quant", type=str, choices=["none", "int8", "int4", "hybrid_int8"], default="none", help="Optional weight quantization")
     parser_engine.add_argument("--kv-cache-dtype", type=str, choices=["fp16", "int8"], default="fp16", help="KV cache storage dtype (default: fp16, int8 cuts KV memory by 50%%)")
-    parser_engine.add_argument("--prefix-cache", action="store_true", default=True, help="Enable automatic prefix caching (default: enabled)")
-    parser_engine.add_argument("--no-prefix-cache", action="store_false", dest="prefix_cache", help="Disable automatic prefix caching")
+    parser_engine.add_argument("--prefix-cache", action="store_true", default=True, help="Enable automatic chained block-hash prefix caching (default: enabled)")
+    parser_engine.add_argument("--no-prefix-cache", action="store_false", dest="prefix_cache", help="Disable automatic chained block-hash prefix caching")
     parser_engine.add_argument("--chunked-prefill", action="store_true", default=True, help="Enable chunked prefill (default: enabled)")
     parser_engine.add_argument("--no-chunked-prefill", action="store_false", dest="chunked_prefill", help="Disable chunked prefill (use monolithic)")
     parser_engine.add_argument("--chunk-size", type=int, default=32, help="Tokens per prefill chunk (default: 32)")
@@ -823,7 +1144,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser_quant.add_argument("--quant", type=str, choices=["none", "int8", "int4", "hybrid_int8"], default="int8", help="Quantization mode (default: int8)")
 
     # Subcommand: prefix-cache
-    parser_pc = subparsers.add_parser("prefix-cache", parents=[parent_parser], help="Benchmark automatic prefix caching & deduplication")
+    parser_pc = subparsers.add_parser("prefix-cache", parents=[parent_parser], help="Benchmark automatic chained block-hash prefix caching & deduplication")
     parser_pc.add_argument("--system-prompt", type=str, default=None, help="Shared system prefix")
     parser_pc.add_argument("--query", type=str, action="append", help="User queries sharing prefix (can specify multiple times)")
 
@@ -862,40 +1183,40 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Subcommand: serve
     parser_serve = subparsers.add_parser("serve", parents=[parent_parser], help="Start OpenAI-compatible streaming REST API server")
-    parser_serve.add_argument("--host", type=str, default="0.0.0.0", help="Host interface to bind (default: 0.0.0.0)")
+    parser_serve.add_argument("--host", type=str, default="127.0.0.1", help="Host interface to bind (default: 127.0.0.1)")
     parser_serve.add_argument("--port", type=int, default=8000, help="Port to listen on (default: 8000)")
     parser_serve.add_argument("--quant", type=str, choices=["none", "int8", "int4", "hybrid_int8"], default="none", help="Optional model quantization (default: none)")
     parser_serve.add_argument(
         "--engine",
         type=str,
-        choices=["hf", "mini-vllm"],
+        choices=["hf", "localstrm", "mini-vllm"],
         default="hf",
-        help="Serving engine backend: 'hf' (default: Hugging Face serial engine) or 'mini-vllm' (Mini-vLLM PagedAttention continuous batching engine)"
+        help="Serving engine backend: 'localstrm' (LocalStrm PagedAttention continuous batching engine; legacy alias: 'mini-vllm') or 'hf' (default: Hugging Face serial engine)"
     )
     parser_serve.add_argument(
         "--batch-size",
         type=int,
         default=4,
-        help="Maximum continuous batch capacity for Mini-vLLM engine (default: 4)"
+        help="Maximum continuous batch capacity for LocalStrm engine (default: 4)"
     )
     parser_serve.add_argument(
         "--total-blocks",
         type=int,
         default=None,
-        help="Total physical KV cache blocks in pool for Mini-vLLM engine"
+        help="Total physical KV cache blocks in pool for LocalStrm engine"
     )
     parser_serve.add_argument(
         "--vram-budget",
         type=str,
         default=None,
-        help="Total engine VRAM operational budget ceiling (e.g. '2GiB', '1400MiB') for Mini-vLLM engine"
+        help="Total engine VRAM operational budget ceiling (e.g. '2GiB', '1400MiB') for LocalStrm engine"
     )
     parser_serve.add_argument(
         "--kv-cache-dtype",
         type=str,
         choices=["fp16", "int8"],
         default="fp16",
-        help="KV cache storage dtype for Mini-vLLM engine (default: fp16, int8 cuts KV memory by 50%%)"
+        help="KV cache storage dtype for LocalStrm engine (default: fp16, int8 cuts KV memory by 50%%)"
     )
 
     # Subcommand: perf-benchmark
