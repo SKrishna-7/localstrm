@@ -1,879 +1,571 @@
 # LocalStrm
 
-> A lightweight PyTorch LLM inference engine built from first principles to explore how modern serving systems such as vLLM work under the hood. Study PagedAttention, KV-cache memory management, continuous batching, prefix caching, and optional hybrid INT8 execution on memory-constrained consumer GPUs.
+**A small, readable LLM inference engine for learning how vLLM works.**
 
-[![Python: 3.11](https://img.shields.io/badge/Python-3.11-green.svg)](INSTALL.md)
-[![PyTorch: 2.1+](https://img.shields.io/badge/PyTorch-2.1%2B-orange.svg)](https://pytorch.org/)
-[![Test Suite: 240 Tests](https://img.shields.io/badge/Test%20Suite-240%20Tests-brightgreen.svg)](tests/)
+Paged KV cache, continuous batching, prefix caching, chunked prefill, and preemption, implemented in plain PyTorch and small enough to read in a weekend.
+
+[![Python 3.11](https://img.shields.io/badge/Python-3.11-green.svg)](INSTALL.md)
+[![PyTorch 2.1+](https://img.shields.io/badge/PyTorch-2.1%2B-orange.svg)](https://pytorch.org/)
+[![Tests: 240](https://img.shields.io/badge/Tests-240-brightgreen.svg)](tests)
+
+---
+
+## What this is (and isn't)
+
+LocalStrm breaks LLM inference into the pieces a serving system is made of (request intake, scheduling, KV-cache memory management, model execution, sampling, and response delivery) and implements each as a separate, inspectable component with tests.
+
+
+- **It is not** a fast engine. Attention uses standard PyTorch `scaled_dot_product_attention` on gathered KV blocks, not a fused paged-attention kernel, and there are no CUDA graphs. In some benchmarks below, plain Hugging Face batching beats it. That is expected, and the results are reported honestly.
+- **It is not** production software. It targets a single GPU, and the server has no authentication.
+
+If you want a fast engine, use [vLLM](https://github.com/vllm-project/vllm). If you want to understand why vLLM is designed the way it is, start here.
+
+## Who it's for
+
+Students and engineers who know roughly what a transformer is and want to answer questions like:
+
+- Why does the KV cache cause memory fragmentation, and how does paging fix it?
+- What does "continuous batching" change compared with normal batching?
+- How can two requests share the same prompt prefix without recomputing it?
+- What happens when the GPU runs out of KV blocks mid-generation?
 
 ---
 
-## On This Page
+## Quick start
 
-- [Overview](#overview)
-- [Installation & Quick Start](#installation--quick-start)
-- [Pre-Download Model & VRAM Preflight](#pre-download-model--vram-preflight)
-- [Core Capabilities & Architecture](#core-capabilities--architecture)
-- [How LocalStrm Works](#how-localstrm-works)
-- [CLI Reference](#cli-reference)
-- [Benchmark Studies](#benchmark-studies-concurrent-serving-scheduling-efficiency-and-quantized-inference)
-- [Tests & Known Limitations](#tests-supported-configurations--known-limitations)
-- [Roadmap](#roadmap)
-- [License](#license)
-
-## Overview
-
-LocalStrm breaks LLM inference into the systems that make text generation possible: model loading, KV-cache memory management, request scheduling, token generation, and serving.
-Instead of treating inference as a single `generate()` call, LocalStrm implements these components as separate, inspectable parts of a PyTorch inference engine. The goal is to make memory management and concurrent request scheduling easier to study in a smaller codebase.
-
-> **Note:** The engine class name `MiniVLLMEngine` and the legacy CLI flag `--engine mini-vllm` are internal identifiers retained for backward compatibility with existing tests and scripts. The canonical user-facing engine selector is `--engine localstrm`.
-
----
-## Installation & Quick Start
-
-LocalStrm is verified on Linux, with Windows support untested/best-effort. Python 3.11 is the recommended starting point, and the following instructions cover virtual environment setup, PyTorch installation, hardware checks, inference, and optional HTTP serving.
-
-### 1. Prerequisites
-
-- **Operating System:** Linux verified (Ubuntu 22.04 LTS or newer), Windows untested/best-effort.
-- **Python:** 3.11 recommended; Python 3.10 is also listed as supported.
-- **GPU inference:** NVIDIA GPU with a compatible driver and CUDA-enabled PyTorch installation.
-- **Git:** Required if you are cloning the repository.
-
-Verify Python is installed:
-
-**Linux (Terminal)**
-
-```bash
-python3.11 --version
-```
-
-**Windows (PowerShell)**
-
-```powershell
-py -3.11 --version
-```
-
-If Python is not installed, download it from the [official Python website](https://www.python.org/downloads/).
-
-### 2. Clone the Repository
-
-Skip this step if you already have the LocalStrm source code.
+Linux is the primary validated platform. Windows has limited testing and is supported on a best-effort basis. A CUDA GPU is recommended; the reference machine is an RTX 4050 laptop with 6 GB.
 
 ```bash
 git clone https://github.com/SKrishna-7/localstrm.git
 cd localstrm
-```
 
-### 3. Create and Activate a Virtual Environment
-
-A virtual environment keeps LocalStrm's Python dependencies separate from other projects.
-
-**Linux (Terminal)**
-
-```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-```
 
-**Windows (PowerShell)**
-
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-```
-
-If PowerShell blocks virtual environment activation, you can use Command Prompt instead:
-
-```bat
-.venv\Scripts\activate.bat
-```
-
-Alternatively, run `.venv\Scripts\python.exe` directly without activating the environment.
-
-### 4. Install PyTorch
-
-For GPU inference, install a PyTorch build compatible with your operating system and NVIDIA driver.
-
-Visit the [official PyTorch installation selector](https://pytorch.org/get-started/locally/) and select your operating system, Pip, Python, and an appropriate CUDA version. Run the generated installation command inside your activated virtual environment.
-
-Verify the installation:
-
-```bash
-python -c "import torch; print('PyTorch:', torch.__version__); print('CUDA available:', torch.cuda.is_available()); print('PyTorch CUDA:', torch.version.cuda)"
-```
-
-For GPU inference, `torch.cuda.is_available()` should return `True`.
-
-### 5. Install LocalStrm Dependencies
-
-Run these commands from the repository root with the virtual environment activated.
-
-**Core inference**
-
-```bash
+# Install a CUDA build of PyTorch first: https://pytorch.org/get-started/locally/
 python -m pip install -r requirements.txt
-```
 
-**HTTP API serving**
-
-Install the serving dependencies if you plan to expose the model through the REST API:
-
-```bash
-python -m pip install -r requirements-serving.txt
-```
-
-**Development, testing, and benchmarks**
-
-For the full development and testing toolset:
-
-```bash
-python -m pip install -r requirements-dev.txt
-```
-
-Choose the dependency setup appropriate for your workflow. If you need multiple feature groups, check the dependency files for overlapping requirements.
-
-### 6. Configure the Python Environment
-
-Set `PYTHONPATH` for the current terminal session.
-
-**Linux (Bash)**
-
-```bash
 export PYTHONPATH=.
-```
-
-**Windows (PowerShell)**
-
-```powershell
-$env:PYTHONPATH = "."
-```
-
-Verify that the CLI loads correctly:
-
-```bash
 python cli.py --help
 ```
 
-### 7. Check Hardware and Model Memory
-
-Before loading a model, run the preflight check:
+Check that a model fits **before** downloading it, then run it:
 
 ```bash
-python cli.py check --model Qwen/Qwen2.5-0.5B --device cuda
-```
+python cli.py check  --model Qwen/Qwen2.5-0.5B --device cuda
 
-LocalStrm estimates model memory requirements, available GPU memory, host RAM, and other capacity constraints before model loading.
-
-**Important:** Preflight is an estimate, not a guarantee that inference will succeed. Actual memory consumption depends on runtime conditions, and CUDA out-of-memory errors may still occur.
-
-### 8. Run Your First Inference
-
-Generate text with the LocalStrm inference engine:
-
-```bash
-python cli.py engine \
-  --model Qwen/Qwen2.5-0.5B \
+python cli.py engine --model Qwen/Qwen2.5-0.5B \
   --prompt "Explain virtual memory in two sentences." \
   --temperature 0.0
 ```
 
-This uses greedy decoding for the selected prompt.
+Platform details, dependency profiles, and troubleshooting are in [INSTALL.md](INSTALL.md).
 
-The first run may download model files if they are not already cached locally.
-
-### 9. Start Interactive Chat
-
-For quick interactive experimentation in the terminal:
-
-```bash
-# Run with LocalStrm native PagedAttention engine:
-python cli.py chat --engine localstrm --model Qwen/Qwen2.5-Coder-0.5B-Instruct
-
-# Or run with the Hugging Face serial backend (default):
-python cli.py chat --engine hf --model Qwen/Qwen2.5-0.5B
-```
-
-**Note:** The `chat` command supports both `--engine localstrm` (LocalStrm's native PagedAttention engine; legacy alias: `--engine mini-vllm`) and `--engine hf` (Hugging Face serial engine, default).
-
-### 10. Start the HTTP API (Optional)
-
-Install the serving dependencies, then start the LocalStrm serving backend:
-
-```bash
-python cli.py serve \
-  --engine localstrm \
-  --model Qwen/Qwen2.5-0.5B \
-  --host 127.0.0.1 \
-  --port 8000
-```
-
-The server listens at `http://127.0.0.1:8000`.
-
-Available endpoints include:
-
-- `POST /v1/chat/completions` - Chat completions, with optional streaming.
-- `POST /v1/completions` - Text completions.
-- `GET /v1/models` - Model information.
-- `GET /health` - Health status.
-- `GET /metrics` - Prometheus metrics.
-- `GET /docs` - Interactive API documentation.
-
-The `localstrm` backend uses LocalStrm's native inference engine (`--engine mini-vllm` is supported as a legacy backwards-compatible alias). The default `hf` backend uses Hugging Face serving instead.
-
-### 11. Platform Notes
-
-- **Windows and Linux:** Run all commands from the repository root using the activated virtual environment.
-- **GPU availability:** Use `--device cuda` only when CUDA is available in PyTorch. CPU execution is available only for supported commands and configurations.
-- **Hybrid INT8:** The optional `hybrid_int8` mode requires an NVIDIA GPU with compute capability 8.0 or newer.
-- **Memory constraints:** Use the preflight command before attempting larger models or more demanding configurations.
-- **Troubleshooting:** For detailed configuration, supported architectures, and additional setup notes, see [`INSTALL.md`](INSTALL.md).
 ---
 
-## Pre-Download Model & VRAM Preflight
+## The 60-second mental model
 
-One of LocalStrm's core capabilities is its **Pre-Flight Memory & Hardware Guard** ([`src/memory/preflight.py`](src/memory/preflight.py)), accessible via the CLI. The output below is an example from a recorded local preflight run, not a guarantee that the same model will fit on every system:
+1. **The KV cache is the memory problem.** Generating each token needs the keys and values of every previous token. That cache grows by one entry per token, and different requests end at different lengths. Reserving one big contiguous buffer per request wastes memory.
+2. **Paging fixes the waste.** Split the cache into fixed-size blocks (16 tokens by default). A per-request *block table* maps logical positions to whichever physical blocks are free. Memory is allocated as needed and recycled when requests finish.
+3. **Continuous batching fixes the idle slots.** In static batching, a batch runs until its slowest request finishes. Here the scheduler runs *one step at a time*: finished requests leave immediately and waiting requests join the next step.
+4. **Prefix caching skips repeated work.** If two prompts start with the same tokens (a shared system prompt), their first blocks can be reused instead of recomputed.
+5. **Preemption handles running out of blocks.** Under memory pressure, the engine frees a victim's blocks and recomputes it later instead of crashing.
+
+```
+Request A has 6 tokens, block_size = 4
+
+logical positions :  [ t0 t1 t2 t3 ] [ t4 t5 .. .. ]
+                        block 0         block 1
+block table (A)   :  [ 7, 2 ]                          <- logical -> physical
+
+physical KV pool  :  0  1  [2]  3  4  5  6  [7]  8 ...
+                              A.b1             A.b0
+```
+
+### Life of a request
+
+```mermaid
+flowchart LR
+    A["Request<br/>prompt + sampling params"] --> B["Tokenize and create<br/>EngineRequest"]
+    B --> C[("Waiting queue")]
+    C --> D{"Scheduler:<br/>enough free<br/>KV blocks?"}
+    D -- no --> C
+    D -- yes --> E["Prefix cache lookup<br/>reuse matching blocks"]
+    E --> F["Prefill<br/>(optionally chunked)"]
+    F --> G["Decode step<br/>batched across sequences"]
+    G --> H["Sample next token"]
+    H --> I{"Stop condition?"}
+    I -- no --> G
+    I -- yes --> J["Free unshared blocks"]
+    G -. "memory pressure" .-> K["Preempt a victim:<br/>free its blocks"]
+    K -.-> C
+```
+
+A request that can never fit in the pool fails instead of waiting forever.
+
+---
+
+## Where each idea lives in the code
+
+Read in this order. Each step builds on the previous one.
+
+| # | vLLM concept | What it does | File |
+|---|---|---|---|
+| 1 | Engine configuration | Block size, batch size, pool size, feature flags | `src/config.py` |
+| 2 | Block manager | Block tables, free pool, allocation and release | `src/memory/block_manager.py` |
+| 3 | Prefix caching | Reuses blocks whose content hash matches | `src/memory/prefix_cache.py` |
+| 4 | Scheduler | Per-step admission and ordering of requests | `src/scheduler/continuous_scheduler.py` |
+| 5 | Chunked prefill | Splits long prompts into per-step token budgets | `src/scheduler/chunked_prefill.py` |
+| 6 | Preemption | Picks a victim, frees its blocks, recomputes later | `src/memory/preemption.py` |
+| 7 | Model runner | Builds batched inputs, runs the forward pass | `src/engine/model_runner.py` |
+| 8 | Paged attention | Gathers non-contiguous blocks, runs attention | `src/kernels/paged_attention.py` |
+| 9 | Sampling | Greedy, temperature, top-p/top-k/min-p, penalties | `src/engine/sampling.py` |
+| 10 | Engine loop | Ties scheduler, memory, and model together | `src/engine/llm_engine.py` |
+
+**Extras** (not needed to understand vLLM's core ideas): quantization (`src/kernels/quantization.py`), the OpenAI-compatible server (`src/server/`), Prometheus metrics (`src/observability/metrics.py`), and the hardware preflight check (`src/memory/preflight.py`).
+
+
+---
+
+
+## Chat CLI: Choosing an Engine
+
+LocalStrm's interactive chat CLI supports two execution backends: Hugging Face Transformers and the native LocalStrm inference engine. Choose a backend with the `--engine` argument.
+
+### Hugging Face Transformers
+
+Use the Hugging Face backend for broader model compatibility and the standard Transformers generation workflow.
+
+```bash
+python cli.py chat \
+  --engine hf \
+  --model Qwen/Qwen2.5-Coder-0.5B-Instruct
+```
+
+### Native LocalStrm Engine
+
+Use the native engine to run interactive conversations through LocalStrm's inference pipeline, including its paged KV-cache management and scheduling architecture.
+
+```bash
+python cli.py chat \
+  --engine localstrm \
+  --model Qwen/Qwen2.5-Coder-0.5B-Instruct \
+  --max-tokens 512
+```
+
+### Engine Comparison
+
+| Feature | Hugging Face (`hf`) | LocalStrm (`localstrm`) |
+|---|---|---|
+| Generation path | Transformers generation API | Native LocalStrm inference loop |
+| KV-cache management | Managed by the Transformers backend | Managed by LocalStrm's paged KV-cache system |
+| Architecture compatibility | Broader compatibility, depending on model and dependencies | Focused on supported dense decoder-only transformer architectures |
+| Scheduling | Depends on the selected Transformers workflow | Uses LocalStrm's native scheduling and continuous-batching architecture |
+| Intended use | General-purpose interactive generation and model compatibility | Exploring and using LocalStrm's inference and memory-management features |
+
+### Interactive Chat Features
+
+The chat CLI supports the following features:
+
+- **Multi-turn conversation:** Continue a conversation with the context of previous turns.
+- **`/clear`:** Reset the conversation history.
+- **`/stats`:** Display available engine and memory statistics.
+- **`/exit`:** End the interactive session.
+- **Stop-token handling:** Stop generation when configured stopping criteria are reached and avoid displaying stop tokens as normal output.
+- **Maximum generation length:** Use `--max-tokens` to limit the number of generated tokens.
+
+### Model Compatibility
+
+The native LocalStrm engine currently targets supported dense decoder-only transformer architectures, such as compatible LLaMA- and Qwen2-style models. Unsupported architectures fail with an error rather than silently falling back to Hugging Face generation.
+
+For models that are not supported by the native engine, use `--engine hf`, provided the model is compatible with your installed Transformers version and dependencies.
+
+### Choosing the Right Backend
+
+Use `hf` when compatibility with the broader Transformers ecosystem is your priority. Use `localstrm` when you want to exercise LocalStrm's own inference pipeline and KV-cache management.
+
+The older `--engine mini-vllm` spelling remains available as a backward-compatible alias for `--engine localstrm`. Use `--engine localstrm` in new commands.
+
+The native engine is not guaranteed to be faster for every model or workload. See [Experiments and Results](#experiments-and-results) for benchmark methodology, limitations, and recorded observations.
+
+---
+## Try the ideas yourself
+
+Each command isolates one concept. The small numbers make the behavior easy to see.
+
+| Concept | Command | What to look for |
+|---|---|---|
+| Continuous vs static batching | `python cli.py perf-benchmark --profile smoke` | The static baseline wastes sequence slots on finished requests; LocalStrm doesn't. |
+| Prefix caching | `python cli.py prefix-cache --system-prompt "You are a Linux kernel expert." --query "How does kswapd work?" --query "Explain the buddy allocator."` | The second query reuses the shared prefix, so its time-to-first-token drops. |
+| Preemption | `python cli.py preempt --total-blocks 5 --block-size 4` | With only 5 tiny blocks, requests get evicted and recomputed, yet all of them finish. |
+| Chunked prefill | `python cli.py chunked-prefill --chunk-size 32` | A long arriving prompt no longer stalls a short request that is already decoding. |
+| INT8 KV cache | `python cli.py engine --vram-budget 2GiB --kv-cache-dtype int8 --prompt "What is a page table?"` | More KV blocks fit in the same budget (at some speed and accuracy cost). |
+
+---
+
+## Experiments and results
+
+All numbers come from a single machine: **RTX 4050 Laptop GPU (6 GB), PyTorch 2.13.0+cu132, CUDA 13.2, Python 3.11.15**, using `Qwen/Qwen2.5-0.5B` unless noted. The three studies used different prompts and measurement boundaries, so **don't compare them with each other**. The raw JSON and one-off experiment scripts aren't included in this repository; `perf-benchmark` runs supported comparable workloads. These are historical, hardware-specific observations, not performance guarantees. The mixed-arrival study above is explicitly limited to scheduler accounting because its arrival timestamps were not reliably enforced.
+
+### 1. Why continuous batching exists (scheduling waste)
+
+Mixed workload: 16 real prompts, generation targets of 16-36 tokens, and 3 repetitions per cell. The earlier benchmark harness did not reliably enforce request arrival timestamps, so arrival-time-sensitive TTFT/end-to-end latency and throughput conclusions from that run are not treated as validated results. The slot-waste figures below are provided only as a scheduler-accounting illustration, not as evidence of an overall performance win.
+
+| Concurrency | HF static: wasted slots | LocalStrm: wasted slots |
+|---:|---:|---:|
+| 1 | 0.0% | 0.0% |
+| 2 | 15.3% | 0.0% |
+| 4 | 23.5% | 0.0% |
+| 8 | 28.8% | 0.0% |
+| 16 | 28.8% | 0.0% |
+
+*Waste = inactive sequence-slot steps / (useful + inactive) slots.* It measures idle batch slots, not GPU idle time. Continuous batching has none **by construction**, so this table shows the idea, not an engineering win.
+
+### 2. Concurrent serving vs a serial server
+
+Fixed 16-token prompt, 32 output tokens, concurrency 1-6, streaming and non-streaming, 120 trials total.
+
+| Concurrency (non-streaming) | HF serial | LocalStrm FP16 KV | Ratio |
+|---:|---:|---:|---:|
+| 1 | 63.21 tok/s | 68.20 tok/s | 1.08x |
+| 2 | 66.69 tok/s | 121.66 tok/s | 1.82x |
+| 4 | 51.43 tok/s | 228.33 tok/s | 4.44x |
+| 6 | 62.76 tok/s | 178.76 tok/s | 2.85x |
+
+Read this as "batching beats handling one request at a time", not "LocalStrm is 4x faster than Hugging Face". The baseline serves requests one by one, so at concurrency 4 the 10x lower time-to-first-token (103 ms vs 1,081 ms) is mostly queueing delay. Throughput peaked at concurrency 4 and fell at 6. INT8 KV was slower than FP16 in these runs because it trades speed for capacity.
+
+### 3. Real-model quantization on a 6 GB GPU (Qwen2.5-3B)
+
+This recorded real-model comparison used full `Qwen/Qwen2.5-3B` weights (5.74 GiB uncompressed safetensors, 36 layers, $d_{\text{model}}=2048$, $d_{\text{mlp}}=11008$), greedy decoding ($T=0.0$), a 9-token prompt, and 16 generated tokens. Timing boundaries used `torch.cuda.synchronize()` before and after execution steps.
+
+| Metric | INT8 baseline (`--quant int8`) | Hybrid INT8 (`--quant hybrid_int8`) | Improvement / delta |
+|---|---:|---:|---:|
+| Decode throughput | 2.92 tok/s | 18.23 tok/s | 6.24x |
+| Average decode latency | 342.60 ms/token | 54.87 ms/token | 6.24x lower latency |
+| Steady-state decode latency (tokens 2-15) | 341.74 ms/token | 52.56 ms/token | 6.50x lower latency |
+| End-to-end throughput, including prefill | 2.20 tok/s | 5.77 tok/s | 2.63x |
+| Time to first token | 2,140.98 ms | 1,948.49 ms | 1.10x faster |
+| Peak allocated VRAM | 3,483.1 MiB | 3,635.8 MiB | +152.8 MiB (+4.4%) |
+| Output-token comparison | Baseline sequence | 12-token identical prefix | Diverged at token 13 (`\n` vs `.`) |
+
+> **Scope:** This table reflects one recorded real-model run per mode, not a multi-run average. The reported speedups apply only to this workload and model. The output sequences diverged, and output quality was not evaluated; this is a performance comparison, not a claim of output parity. Independent hardware-counter verification of Tensor Core use was not performed.
+
+### How to read these results
+
+- One GPU, small models, short generations, 3-5 repetitions, no variance reported.
+- Baselines are Hugging Face serial and static batching, not vLLM or other optimized engines.
+- Treat them as demonstrations of *mechanisms*, not as performance claims.
+
+---
+
+## Preflight: check memory before downloading
+
+`python cli.py check` estimates whether a model will fit **before** any weights are downloaded (`src/memory/preflight.py`). It reads only Hub metadata and `config.json` (about 3 KB), or file sizes for a local directory.
 
 ```bash
 python cli.py check --model Qwen/Qwen2.5-3B --quant hybrid_int8 --device cuda
 ```
 
-```text
-================================================================================
-                    PRE-FLIGHT HARDWARE & MEMORY AUDIT REPORT
-================================================================================
-Model: Qwen/Qwen2.5-3B | Device: cuda (NVIDIA GeForce RTX 4050 Laptop GPU)
-Quantization Precision: hybrid_int8
-[CAPACITY ESTIMATION]
-  Available GPU VRAM:       5.71 GiB (with 5% safety margin: 5.42 GiB)
-  Available Host RAM:       23.40 GiB
-  Available Disk Space:     184.20 GiB
-[PROJECTED MEMORY CONSUMPTION]
-  Model Compressed Weights: ~3.16 GiB
-  KV-Cache Footprint:       ~0.25 GiB (batch=1, context=2048)
-  CUDA Runtime Overhead:    ~0.80 GiB (context + activation buffers)
-  ------------------------------------------------------------------
-  Total Projected VRAM:     ~4.21 GiB
-[STATUS] PASS: Model is projected to fit safely in GPU VRAM.
-================================================================================
-```
+The report calculates the estimate from the selected model, quantization mode, current available resources, configured context/batch assumptions, and the engine's safety allowances. **Read the output produced on your own machine; do not rely on memory figures copied from another machine or an earlier run.**
 
-### How Preflight Operates Before Downloading Weights
+What it checks:
 
-1. **Lightweight Metadata Fetching:**
-   Before downloading multi-gigabyte tensor files, the preflight guard inspects the repository metadata via `huggingface_hub.HfApi.model_info()` or downloads only the lightweight `config.json` (~3 KB). For local directories, it scans file sizes on disk without loading weights into RAM or VRAM.
-2. **Hardware Capacity Inspection:**
-   Queries `torch.cuda.mem_get_info()` for free VRAM, `psutil.virtual_memory()` for available host RAM, and `shutil.disk_usage()` for target cache storage.
-3. **Multi-Stage Fit Calculations:**
-   - **Weight Memory:** Scaled by precision factor (1.0 for FP16, 0.50 for INT8, 0.55 for Hybrid INT8, 0.25 for INT4).
-   - **KV-Cache Footprint:** Exact analytical formula: $2 \times \text{layers} \times \text{kv\_heads} \times \text{head\_dim} \times \text{bytes\_per\_elem} \times \text{max\_context} \times \text{batch\_size}$.
-   - **Host RAM Staging Check:** When using quantized modes (`int8` or `hybrid_int8`), uncompressed FP16 weights are loaded into host RAM first for in-place quantization before transferring compressed weights to GPU. Preflight verifies host RAM can hold uncompressed weights before allowing download.
-   - **Disk Space Check:** Verifies sufficient free disk space for uncompressed checkpoints plus a 10% safety buffer.
-4. **Fail-Closed Safety:**
-   If model metadata cannot be resolved (e.g. invalid repository ID, network failure, or inaccessible model), preflight aborts with **exit code 1** and actionable guidance rather than proceeding with unresolved model metadata.
-5. **Estimate vs. Guarantee:**
-   Preflight provides a **rigorous analytical estimate**, not an absolute operating guarantee. Dynamic activation memory varies with runtime batch composition, and CUDA allocator fragmentation can lead to allocation errors if background processes consume VRAM.
+- **GPU memory:** weights (scaled by quantization mode) + KV cache + runtime overhead, against free VRAM with a safety margin.
+- **KV cache size:** `2 x layers x kv_heads x head_dim x bytes_per_element x context x batch`.
+- **Host RAM:** quantized modes load FP16 weights into CPU RAM first, so RAM must hold them.
+- **Disk:** checks that enough space is available for the model download, including the configured safety allowance.
+- **Fail-closed:** if required metadata cannot be resolved, preflight exits with an error rather than silently guessing. `--force` bypasses the preflight guard.
+
+It is an **estimate, not a guarantee**: activation memory varies with batch composition, and other GPU processes can still cause an out-of-memory error.
+
+With `--vram-budget 2GiB` (instead of `--total-blocks`), the engine subtracts weights, overhead, workspace, and a safety margin from your budget and sizes the KV pool from what's left.
+
 
 ---
 
-## Core Capabilities & Architecture
+## Optional extras
 
-```text
-Inference Engine Architecture
-├── cli.py                     # Unified entry point (engine, chat, serve, check, benchmark)
-├── src/
-│   ├── config.py              # Engine configuration & environment overrides
-│   ├── engine/
-│   │   ├── llm_engine.py      # Core execution loop & physical memory binding
-│   │   ├── model_runner.py    # Batched model execution & GQA pointer gathering
-│   │   └── sampling.py        # Probability shaping (Top-P, Top-K, Min-P, penalties)
-│   ├── memory/
-│   │   ├── block_manager.py   # Virtual-to-physical block tables & pool allocator
-│   │   ├── prefix_cache.py    # Content-addressed chained block-hash deduplication
-│   │   ├── preemption.py      # Victim selection, eviction & recompute rollback
-│   │   └── preflight.py       # Hardware capacity & metadata preflight checks
-│   ├── kernels/
-│   │   ├── paged_attention.py # Gathered SDPA attention for non-contiguous KV blocks
-│   │   └── quantization.py    # Dynamic INT8 & Opt-In Hybrid INT8 (torch._int_mm)
-│   ├── scheduler/
-│   │   ├── continuous_scheduler.py # Iteration-level continuous batching scheduler
-│   │   ├── chunked_prefill.py # Interleaved prompt slicing for latency smoothing
-│   │   └── static_batching.py # Padded batching baseline for comparative benchmarks
-│   ├── server/
-│   │   ├── app.py             # FastAPI application & lifespan management
-│   │   ├── protocol.py        # Pydantic v2 schemas for OpenAI REST protocol
-│   │   ├── serving_adapter.py # Async serving queue & background worker adapter
-│   │   └── serving_engine.py  # Thread-safe async streaming engine
-│   └── observability/
-│       └── metrics.py         # Prometheus metrics exporter & latency histograms
-└── tests/                     # 19 automated regression & integration test modules
-```
+### Quantization
 
-### Architectural Highlights
-
-1. **PagedAttention & Physical Block Manager:**
-   Stores KV-cache state in fixed-size physical blocks (16 tokens per block) and maps logical token positions to those blocks. This avoids requiring each request to own one large contiguous KV-cache allocation.
-2. **Continuous (Iteration-Level) Batching:**
-   Evaluates decode steps iteration by iteration. Completed requests depart immediately, and arriving requests are scheduled into active iterations without waiting for entire batch completion, reducing inactive sequence-slot scheduling waste relative to locked static batching (measured up to 28.8% on the tested mixed-length workload).
-3. **Automatic Prefix Caching:**
-   Computes SHA-256 content hashes for token blocks and reuses matching cached prefix state when available, avoiding repeated prefill computation for the reused portion.
-4. **Hybrid INT8 Execution Mode:**
-   An opt-in precision mode (`--quant hybrid_int8`). Attention projections remain in FP16, while MLP projections (`gate_proj`, `up_proj`, `down_proj`) use integer matrix multiplication via `torch._int_mm`. Tensor Core execution was not independently verified with hardware performance counters in the reported benchmark.
-5. **CPU-Staged Quantized Loading:**
-   When loading quantized models on CUDA, uncompressed FP16 weights are loaded into host RAM first, quantized in place, and only compressed weights are transferred to GPU VRAM. Full uncompressed weights never touch GPU memory.
-6. **OpenAI-Compatible REST Server:**
-   FastAPI application implementing `/v1/chat/completions` (supporting streaming Server-Sent Events and non-streaming responses), `/v1/models`, `/health`, and Prometheus `/metrics`.
-
----
-
-## How LocalStrm Works
-
-LocalStrm separates the work of inference into request handling, scheduling, KV-cache management, model execution, sampling, and response delivery. This makes the mechanics of a serving engine easier to inspect and test.
+| Flag | Meaning | Requirement |
+|---|---|---|
+| `--quant none` | No LocalStrm weight quantization; uses the model loader's configured floating-point dtype | Any supported device |
+| `--quant int8` | W8A16: INT8 weights, FP16 activations | Any CUDA GPU |
+| `--quant int4` | W4A16: INT4 weights, FP16 activations | Any CUDA GPU |
+| `--quant hybrid_int8` | INT8 matmul for MLP layers only | Compute capability 8.0+ (Ampere or newer) and `torch._int_mm` |
+| `--kv-cache-dtype int8` | INT8 KV cache with FP16 scales per token and KV head; roughly half the KV-cache storage of FP16 | CUDA |
 
 
-### End-to-End Request Lifecycle
+Quantized models load in FP16 on the CPU, are quantized there, and only the compressed weights move to the GPU.
 
-1. **Request entry:** `cli.py engine` submits prompts to `MiniVLLMEngine`. `cli.py chat` supports both `--engine localstrm` (native PagedAttention engine) and `--engine hf` (default Hugging Face serial engine). For HTTP requests, the server backend depends on `--engine`: the default `hf` backend uses Hugging Face serving, while `--engine localstrm` (legacy alias: `--engine mini-vllm`) selects LocalStrm's engine and serving adapter.
-2. **Tokenization and registration:** The ingress layer formats chat messages when applicable, tokenizes the prompt, and creates an `EngineRequest` with its sampling settings. New requests enter the waiting queue until the scheduler can admit them.
-3. **Scheduling and prefix reuse:** The scheduler considers available KV-cache blocks, request length limits, and memory pressure. When prefix caching is enabled, matching 16-token blocks can be reused through chained SHA-256 hashes. A request that cannot fit in the pool fails rather than remaining queued indefinitely.
-4. **Prompt prefill:** The engine processes prompt tokens to populate the KV cache. Optional chunked prefill divides longer prompts into smaller pieces so prefill work can be interleaved with decode work.
-5. **Decode and attention:** `batched_decode=True` is the standard execution path. Ready sequences can be decoded while other requests are still completing chunked prefill. The model runner performs batched model operations and reads cached keys and values through the physical block mapping. The opt-in serial mode (`batched_decode=False`) supports numerical-contract checks.
-6. **Token sampling:** The engine selects the next token using greedy or stochastic sampling. Batched greedy argmax is a conditional fast path for multiple sequences when batched sampling is enabled and every request uses unpenalized greedy settings; other configurations use per-request sampling.
-7. **Stopping and memory reclamation:** Generation stops when a configured stopping condition is reached, including EOS, a length limit, or supported stop criteria. Unshared blocks are released; cached prefix blocks may remain available for reuse until eviction is needed.
-8. **Response delivery:** `cli.py engine` prints completed output after execution. The applicable HTTP serving path can stream OpenAI-compatible Server-Sent Events. Token-by-token terminal streaming belongs to the separate `cli.py chat` REPL, not `cli.py engine`.
-
-This architecture reflects the current implementation rather than a claim of feature or performance parity with vLLM. See the CLI reference and benchmark sections for supported options and measured trade-offs.
-
----
-
-## CLI Reference
-
-LocalStrm provides a unified command-line interface (`cli.py`) for offline model inspection, memory preflight validation, continuous batching inference, OpenAI-compatible HTTP serving, and automated subsystem benchmarking.
+### OpenAI-compatible server
 
 ```bash
-python cli.py <subcommand> [flags...]
+python -m pip install -r requirements-serving.txt
+
+python cli.py serve --engine localstrm --model Qwen/Qwen2.5-0.5B --port 8000
 ```
-
-### 1. Command Overview
-
-The CLI exposes 15 dedicated subcommands and 1 alias across four operational categories:
-
-| Subcommand | Category | Description | Primary Engine / Backend |
-| :--- | :--- | :--- | :--- |
-| `engine` | Inference | Unified continuous batching inference with PagedAttention, chunked prefill, and chained block-hash prefix caching | `MiniVLLMEngine` |
-| `chat` | Inference | Interactive multi-turn streaming terminal chat REPL | Hugging Face Pipeline |
-| `serve` | HTTP Serving | OpenAI-compatible FastAPI streaming REST API server (`/v1/chat/completions`, `/v1/completions`) | `MiniVLLMEngine` or Hugging Face |
-| `check` | Hardware & Preflight | Pre-download VRAM and system memory capacity check before weight allocation | `src.memory.preflight` |
-| `inspect` | Hardware & Preflight | Deep model parameter, layer geometry, and VRAM budget breakdown | `benchmarks.inspect_model` |
-| `list-models` | Hardware & Preflight | List locally downloaded and cached Hugging Face model repositories | Hugging Face Cache Hub |
-| `models` | Hardware & Preflight | Alias for `list-models` | Hugging Face Cache Hub |
-| `perf-benchmark` | Diagnostics & Benchmarks | Systematic multi-concurrency performance benchmark (Static Baseline vs LocalStrm) | `benchmarks.run_benchmark` |
-| `benchmark` | Diagnostics & Benchmarks | Continuous batching throughput and latency benchmark across concurrent prompts | `ContinuousBatchingEngine` |
-| `quantize` | Diagnostics & Benchmarks | Benchmark weight quantization (INT8, INT4, HYBRID_INT8) against unquantized FP16 | Quantized Engine |
-| `prefix-cache` | Diagnostics & Benchmarks | Chained block-hash prefix cache deduplication efficiency and time-to-first-token benchmark | Prefix Cache Engine |
-| `preempt` | Diagnostics & Benchmarks | Memory starvation preemption and recompute benchmark under extreme KV block constraints | `StarvationResilientEngine` |
-| `chunked-prefill` | Diagnostics & Benchmarks | Interleaved chunked prefill vs monolithic prefill decode latency jitter benchmark | Chunked Prefill Scheduler |
-| `metrics` | Diagnostics & Benchmarks | Execute inference workload with real-time Prometheus telemetry dashboard and HTTP exporter | `MiniVLLMEngine` + Prometheus |
-| `stress-test` | Diagnostics & Benchmarks | Head-to-head stress benchmark comparing HF static tensor batching vs LocalStrm | Static vs Continuous Batching |
-| `test` | Diagnostics & Benchmarks | Comprehensive automated regression test runner across all 12 engine subsystems | `tests/test_all_features.py` |
-
-### 2. Common Options
-
-All subcommands (except `test`, which is a standalone regression test runner) inherit the parent parser options:
-
-| Flag | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--model MODEL` | String | Dynamic (see below) | Hugging Face model repository ID (e.g., `Qwen/Qwen2.5-0.5B`) or local directory path containing model weights and configuration. |
-| `--device {cuda,cpu}` | String | Dynamic (see below) | Compute execution device. Auto-selects CUDA when an active GPU is detected; falls back to CPU otherwise. |
-| `-v`, `--verbose` | Flag | `False` | Enables detailed debug logging, displaying block table allocations, scheduler state transitions, and step timing. |
-| `--force` | Flag | `False` | Bypasses fail-closed preflight memory and hardware capacity checks, forcing execution even if estimated VRAM exceeds available capacity. |
-| `-l`, `--list-models`, `--models` | Flag | `False` | Lists all locally cached Hugging Face models found in `~/.cache/huggingface/hub` and exits immediately without running the subcommand. |
-
-#### Dynamic Default Resolution
-
-- **`--model`**: Evaluates the environment variable `$MODEL_ID`. If unset, falls back to `Qwen/Qwen2.5-0.5B`.
-- **`--device`**: Evaluates the environment variable `$ENGINE_DEVICE`. If unset, queries `torch.cuda.is_available()`; resolves to `"cuda"` if a compatible GPU is present, otherwise `"cpu"`.
-
-### 3. Inference Commands
-
-#### `cli.py engine`
-
-Executes single or batched prompt inference using the full `MiniVLLMEngine` pipeline with PagedAttention, continuous batching, chunked prefill, and optional chained block-hash prefix caching.
 
 ```bash
-python cli.py engine --prompt "Your prompt here" [flags...]
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen2.5-0.5B",
+       "messages": [{"role": "user", "content": "What is a page table?"}],
+       "max_tokens": 64}'
 ```
 
-| Flag | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--prompt PROMPT` | String | `None` **(stdin allowed)** | Input prompt to generate from. Can be specified multiple times for batched concurrent evaluation (e.g., `--prompt "Q1" --prompt "Q2"`), or piped via stdin. |
-| `--max-tokens INT` | Integer | `32` | Maximum number of new generation tokens per response sequence. |
-| `--batch-size INT` | Integer | `4` | Maximum continuous batch capacity (concurrent sequences running in the scheduler). |
-| `--total-blocks INT` | Integer | `None` **(auto-sized)** | Explicit total physical KV cache blocks allocated in the pool. Mutually exclusive with `--vram-budget`. |
-| `--vram-budget STR` | String | `None` | Operational VRAM budget ceiling (e.g., `2GiB`, `1400MiB`). Sizer calculates maximum KV blocks after deducting model weights, activation workspace, and safety margins. Mutually exclusive with `--total-blocks`. |
-| `--block-size INT` | Integer | `16` | Token capacity per physical KV block. Must align with PagedAttention kernel constraints. |
-| `--quant {none,int8,int4,hybrid_int8}` | String | `none` | Weight quantization mode. `int8` (W8A16), `int4` (W4A16), or `hybrid_int8` (requires SM >= 8.0; uses `torch._int_mm` for MLP projections). |
-| `--kv-cache-dtype {fp16,int8}` | String | `fp16` | KV cache storage datatype. Selecting `int8` activates symmetric per-token, per-head INT8 quantization (scales shaped `(layers, blocks, block_size, kv_heads, 1)`), reducing KV memory footprint by ~50%. |
-| `--prefix-cache` / `--no-prefix-cache` | Flag | Enabled (`True`) | Enables or disables automatic chained block-hash prefix caching for common prompt prefixes and multi-turn conversations. |
-| `--chunked-prefill` / `--no-chunked-prefill` | Flag | Enabled (`True`) | Enables or disables chunked prefill scheduling. When disabled, prompts prefill in a single monolithic step. |
-| `--chunk-size INT` | Integer | `32` | Maximum token chunk budget allocated per prefill step to prevent decode latency spikes. |
-| `--temperature FLOAT` | Float | `0.0` | Sampling temperature. `0.0` executes deterministic greedy argmax sampling; `> 0.0` enables stochastic sampling. |
-| `--top-p FLOAT` | Float | `1.0` | Top-P nucleus sampling threshold ($0.0 < p \le 1.0$). Retains smallest token set whose cumulative probability exceeds $P$. |
-| `--top-k INT` | Integer | `-1` | Top-K sampling threshold. `-1` disables Top-K filtering. |
-| `--min-p FLOAT` | Float | `0.0` | Dynamic minimum probability threshold relative to the top candidate token ($0.0 \le \text{min\_p} \le 1.0$). |
-| `--repetition-penalty FLOAT` | Float | `1.0` | Penalizes tokens that have already appeared in the generated sequence (`1.0` disables this penalty). |
-| `--stop STR` | String | `[]` | Early termination stop strings. Can be specified multiple times (e.g., `--stop "###" --stop "\n\n"`). |
-| `--metrics` / `--no-metrics` | Flag | Enabled (`True`) | Displays a formatted ASCII telemetry summary table (throughput, latency, KV cache utilization) upon workload completion. |
-| `--export-prometheus PATH` | String | `None` | File path to export engine telemetry metrics in standard Prometheus plaintext format upon completion. |
+Endpoints: `POST /v1/chat/completions` (streaming via SSE), `POST /v1/completions`, `GET /v1/models`, `GET /health`, `GET /metrics` (Prometheus), `GET /docs`.
 
-#### `cli.py chat`
+> **Security:** the server binds to `127.0.0.1` by default and has **no authentication**. Binding to `0.0.0.0` exposes it to your whole network. Don't do that on an untrusted network.
 
-Launches an interactive, multi-turn conversational streaming session in your terminal.
+`--engine localstrm` selects LocalStrm's native engine; the default `hf` backend serves requests through Hugging Face instead. (`localstrm` and the `MiniVLLMEngine` class are the project's earlier name.)
 
-```bash
-python cli.py chat [flags...]
-```
+#### VS Code with Continue
 
-| Flag | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--engine {hf,localstrm,mini-vllm}` | String | `hf` | Chat engine backend: `localstrm` (LocalStrm PagedAttention continuous batching engine; legacy alias: `mini-vllm`) or `hf` (default: Hugging Face serial engine). |
-| `--quant {none,int8,int4,hybrid_int8}` | String | `none` | Weight quantization precision applied to the chat model. |
-| `--max-tokens INT` | Integer | `128` | Maximum new tokens generated per conversational turn. |
-| `--temperature FLOAT` | Float | `0.7` | Sampling temperature for creative conversational variety (`0.0` for greedy). |
-| `--system STR` | String | `None` | Custom system prompt overriding the model's default conversation persona. |
-| `--batch-size INT` | Integer | `4` | Maximum continuous batch capacity for LocalStrm engine. |
-| `--total-blocks INT` | Integer | `None` | Total physical KV cache blocks for LocalStrm engine. |
-| `--vram-budget STR` | String | `None` | Total engine VRAM operational budget ceiling for LocalStrm engine. |
-| `--kv-cache-dtype {fp16,int8}` | String | `fp16` | KV cache storage dtype for LocalStrm engine (default: fp16, int8 cuts KV memory by 50%). |
+A small local setup verified during manual smoke testing used `Qwen/Qwen2.5-Coder-0.5B-Instruct` on an RTX 4050 laptop. The example below is a starting point, not a universal VRAM guarantee.
 
-> [!NOTE]
-> **Execution Backends: `localstrm` vs. `hf`**<br>
->
-> - `cli.py chat --engine localstrm` executes LocalStrm's core `MiniVLLMEngine` architecture in an interactive terminal session, streaming responses token-by-token with non-contiguous PagedAttention memory management, prefix caching, and live TTFT/TPOT latency metrics.
->
-> - `cli.py chat --engine hf` (default) provides a serial REPL powered by Hugging Face's sequential decode pipeline.
-
-### 4. Hardware & Memory Preflight
-
-#### `cli.py check`
-
-Runs fail-closed static memory preflight verification before any model weights or KV cache memory are allocated.
-
-```bash
-python cli.py check --model Qwen/Qwen2.5-0.5B --device cuda
-```
-
-| Flag | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--quant {none,int8,int4,hybrid_int8}` | String | `none` | Target quantization mode to evaluate during preflight budget calculations. |
-
-- **Exit Codes:** Returns exit code `0` on successful capacity verification; returns exit code `1` if estimated memory requirements exceed safe operational thresholds (5% safety margin).
-
-#### `cli.py inspect`
-
-Inspects model configuration metadata, architecture parameters, tensor shapes, and calculated VRAM requirements across various context lengths and batch sizes without loading full model weights.
-
-```bash
-python cli.py inspect --model Qwen/Qwen2.5-0.5B
-```
-
-**Inherits common parent options (`--model`, `--device`, `-v`, `--force`). Does not require additional subcommand flags.**
-
-#### `cli.py list-models` (alias: `cli.py models`)
-
-Inspects the local Hugging Face hub cache directory (`~/.cache/huggingface/hub`) and prints a tabular summary of all downloaded models, snapshot paths, and disk sizes.
-
-```bash
-python cli.py list-models
-# Or:
-python cli.py models
-```
-
-### 5. HTTP Serving
-
-#### `cli.py serve`
-
-Launches an OpenAI-compatible REST API server powered by FastAPI and Uvicorn.
-
-```bash
-python cli.py serve --engine localstrm --model Qwen/Qwen2.5-0.5B --host 127.0.0.1 --port 8000
-```
-
-| Flag | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--host STR` | String | `127.0.0.1` | Network interface address to bind the HTTP server. The server provides no built-in authentication; binding to 0.0.0.0 exposes the API to the local network or internet. |
-| `--port INT` | Integer | `8000` | TCP port to listen for incoming HTTP connections. |
-| `--quant {none,int8,int4,hybrid_int8}` | String | `none` | Optional model weight quantization. |
-| `--engine {hf,localstrm,mini-vllm}` | String | `hf` | Serving backend engine. Choose `localstrm` (canonical; legacy alias: `mini-vllm`) for true continuous batching or `hf` for sequential Hugging Face serving. |
-| `--batch-size INT` | Integer | `4` | Maximum continuous batch capacity. **Applies strictly to `--engine localstrm` (or legacy `mini-vllm`).** |
-| `--total-blocks INT` | Integer | `None` | Explicit physical KV cache block count. Mutually exclusive with `--vram-budget`. **Applies strictly to `--engine localstrm`.** |
-| `--vram-budget STR` | String | `None` | Total VRAM operational budget ceiling (e.g., `2GiB`, `1400MiB`). Mutually exclusive with `--total-blocks`. **Applies strictly to `--engine localstrm`.** |
-| `--kv-cache-dtype {fp16,int8}` | String | `fp16` | KV cache storage datatype (`fp16` or `int8`). **Applies strictly to `--engine localstrm`.** |
-
-> [!WARNING]
-
-> **Engine Backend Compatibility in `serve`:**<br>
-
-> When running `--engine hf` (the default), requests are served sequentially via Hugging Face pipelines. Options `--total-blocks`, `--vram-budget`, and `--kv-cache-dtype` belong strictly to LocalStrm's PagedAttention engine; specifying them under `--engine hf` produces a warning and they are ignored. To use LocalStrm continuous batching, pass `--engine localstrm` (or legacy alias `--engine mini-vllm`).
-
-#### Served Endpoints
-
-Once running, the server exposes the following HTTP endpoints:
-- `POST /v1/chat/completions`: OpenAI-compatible chat completions (supports streaming `stream: true` via Server-Sent Events).
-- `POST /v1/completions`: OpenAI-compatible text completions (supports streaming).
-- `GET /v1/models`: Lists active model identifier and metadata.
-- `GET /health`: Server health check returning engine status and device utilization.
-- `GET /metrics`: Prometheus plaintext telemetry metrics.
-- `GET /docs`: Interactive Swagger / OpenAPI documentation UI.
-
-### 6. Benchmarking & Diagnostics
-
-LocalStrm includes dedicated diagnostic runners to isolate, test, and benchmark individual architectural subsystems.
-
-#### `cli.py perf-benchmark`
-
-Executes an automated multi-concurrency performance benchmark matrix comparing static batching against continuous batching under controlled synthetic or mixed workloads.
-
-```bash
-python cli.py perf-benchmark --profile smoke
-```
-
-| Flag | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--profile {smoke,full}` | String | `smoke` | Preconfigured test execution profile. `smoke` executes a quick ~15-second verification run; `full` executes the exhaustive multi-concurrency matrix. |
-| `--concurrencies STR` | String | `None` | Comma-separated list of concurrency levels (e.g., `"1,2,4,8"`). Overrides profile preset. |
-| `--engines STR` | String | `None` | Comma-separated list of engines to benchmark (e.g., `"baseline,minivllm-fp16,minivllm-int8"`). |
-| `--workloads STR` | String | `None` | Comma-separated list of prompt workload distributions (e.g., `"fixed,mixed"`). |
-| `--num-requests INT` | Integer | `None` | Total requests dispatched per concurrency level. |
-| `--repetitions INT` | Integer | `1` | Benchmark measurement iterations per test cell to calculate stable statistical means. |
-| `--output-dir PATH` | String | `None` | Custom directory to save benchmark summary reports and raw metric logs. |
-
-#### Subsystem Microbenchmarks
-
-| Subcommand | Flag | Type | Default | Description |
-| :--- | :--- | :--- | :--- | :--- |
-| **`benchmark`** | `--prompt STR` | String (appendable) | Default suite | Custom benchmark prompt (can be passed multiple times). |
-| | `--max-tokens INT` | Integer | `16` | Maximum generation tokens per request. |
-| | `--batch-size INT` | Integer | `4` | Maximum continuous batch capacity. |
-| **`quantize`** | `--prompt STR` | String | Sample prompt | Input prompt to test quantized generation accuracy. |
-| | `--quant CHOICE` | `none,int8,int4,hybrid_int8` | `int8` | Target quantization mode to evaluate. |
-| **`prefix-cache`** | `--system-prompt STR` | String | Sample prompt | Shared system prompt prefix to evaluate prefix caching hit rate. |
-| | `--query STR` | String (appendable) | Sample queries | User queries sharing the prefix (can be specified multiple times). |
-| **`preempt`** | `--prompt STR` | String (appendable) | Sample workload | Request prompts to induce memory pressure. |
-| | `--tokens INT` | Integer | `12` | Generation tokens per sequence. |
-| | `--total-blocks INT` | Integer | `5` | Artificially constrained physical block pool to trigger preemption. |
-| | `--block-size INT` | Integer | `4` | Tokens per physical KV block. |
-| **`chunked-prefill`**| `--chunk-size INT` | Integer | `32` | Maximum tokens per prefill chunk. |
-| | `--prompt-short STR` | String | Sample prompt | Active short decoding sequence to measure latency disruption. |
-| | `--prompt-long STR` | String | Sample prompt | Long arrival prefill prompt inducing prefill computation. |
-| **`metrics`** | `--prompt STR` | String (appendable) | Sample prompt | Workload prompt text to process. |
-| | `--max-tokens INT` | Integer | `24` | Maximum tokens per response. |
-| | `--batch-size INT` | Integer | `4` | Maximum continuous batch capacity. |
-| | `--kv-cache-dtype` | `fp16,int8` | `fp16` | KV cache storage datatype. |
-| | `--export PATH` | String | `None` | File path to export final Prometheus metrics. |
-| | `--serve` | Flag | `False` | Starts a persistent background HTTP server exposing `/metrics`. |
-| | `--port INT` | Integer | `9090` | Port for the background telemetry HTTP exporter. |
-| **`stress-test`** | `--requests INT` | Integer | `8` | Number of concurrent requests in the stress workload. |
-| | `--batch-size INT` | Integer | `4` | Maximum continuous batch capacity. |
-| | `--kv-cache-dtype` | `fp16,int8` | `fp16` | KV cache storage datatype for LocalStrm. |
-| **`test`** | **(No flags)** | N/A | N/A | Executes the automated test suite (`python tests/test_all_features.py`). |
-
-### 7. Practical Recipes
-
-#### Recipe 1: Preflight Memory Safety Check
-
-Verify whether a model and its KV cache can safely fit in available GPU VRAM before downloading weights:
-
-```bash
-python cli.py check --model Qwen/Qwen2.5-0.5B --device cuda
-```
-
-#### Recipe 2: Single-Prompt Deterministic Inference
-
-Run greedy decoding on a single prompt with custom token length:
-
-```bash
-python cli.py engine \
-  --model Qwen/Qwen2.5-0.5B \
-  --prompt "Explain virtual memory paging in two sentences." \
-  --max-tokens 48 \
-  --temperature 0.0
-```
-
-#### Recipe 3: Batched Inference Under Strict VRAM Budget
-
-Run concurrent requests with INT8 KV cache under an explicit 2.0 GiB operational VRAM ceiling:
-
-```bash
-python cli.py engine \
-  --model Qwen/Qwen2.5-0.5B \
-  --vram-budget 2GiB \
-  --kv-cache-dtype int8 \
-  --prompt "What is a page table?" \
-  --prompt "Describe copy-on-write." \
-  --prompt "Explain TLB misses." \
-  --max-tokens 32
-```
-
-#### Recipe 4: Interactive Streaming Chat with Quantization
-
-Start an interactive terminal conversation using W8A16 weight quantization to conserve memory:
-
-```bash
-python cli.py chat \
-  --model Qwen/Qwen2.5-0.5B \
-  --quant int8 \
-  --temperature 0.7 \
-  --max-tokens 128
-```
-
-#### Recipe 5: OpenAI-Compatible REST Server
-
-Launch the HTTP server backed by the LocalStrm continuous batching engine:
+Start the server:
 
 ```bash
 python cli.py serve \
   --engine localstrm \
-  --model Qwen/Qwen2.5-0.5B \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --batch-size 8 \
-  --kv-cache-dtype int8
+  --model Qwen/Qwen2.5-Coder-0.5B-Instruct \
+  --quant none \
+  --kv-cache-dtype fp16 \
+  --batch-size 1 \
+  --total-blocks 128 \
+  --port 8000
 ```
 
-#### Recipe 6: Quick Performance Benchmark (Smoke Profile)
+In Continue's `config.yaml`, configure the OpenAI-compatible provider:
 
-Run a quick ~15-second benchmark comparing Hugging Face static tensor batching vs LocalStrm:
+```yaml
+name: LocalStrm
+version: 1.0.0
+schema: v1
+
+models:
+  - name: LocalStrm Qwen Coder
+    provider: openai
+    model: Qwen/Qwen2.5-Coder-0.5B-Instruct
+    apiBase: http://127.0.0.1:8000/v1
+    apiKey: localstrm
+    roles:
+      - chat
+      - edit
+    defaultCompletionOptions:
+      contextLength: 2048
+      maxTokens: 512
+      temperature: 0.2
+```
+
+Select **Chat** mode in Continue and begin with a short prompt. If the server reports KV-cache exhaustion or CUDA out-of-memory, reduce the context/output limits or the configured KV pool to fit the GPU; larger values are not automatically better. The server has no authentication, so keep it bound to localhost unless you add an authentication layer.
+
+### Metrics
+
+`python cli.py metrics --serve --port 9090` runs a workload while exposing Prometheus metrics (throughput, latency histograms, KV-cache utilization). This CLI workload is separate from the `/metrics` endpoint exposed by the OpenAI-compatible API server.
+
+#### Prometheus and Grafana with Docker Compose
+
+The repository's Docker Compose monitoring setup runs Prometheus and Grafana alongside the API server. The example configuration maps Prometheus to host port `9091` and Grafana to host port `3001` to avoid conflicting with services already using `9090` or `3000`.
+
+1. Start the LocalStrm API server in one terminal:
+
+   ```bash
+   python cli.py serve \
+     --engine localstrm \
+     --model Qwen/Qwen2.5-0.5B \
+     --host 0.0.0.0 \
+     --port 8000
+   ```
+
+   The Prometheus container must be able to reach the host API at port `8000`. This example binds to all host interfaces, so use it only on a trusted development machine/network. The server has no authentication; do not expose it to an untrusted network.
+
+2. From the repository root, start the monitoring stack in another terminal:
+
+   ```bash
+   docker compose up -d
+   ```
+
+   The Compose configuration should include `docker-compose.yml` and `monitoring/prometheus.yml`, with Prometheus scraping `host.docker.internal:8000` and the Docker host-gateway mapping configured for Linux. Check the target configuration if your local files differ.
+
+3. Open the monitoring interfaces:
+
+   - **Prometheus:** [http://localhost:9091](http://localhost:9091)
+   - **Prometheus targets:** [http://localhost:9091/targets](http://localhost:9091/targets). The LocalStrm target should be `UP`.
+   - **Grafana:** [http://localhost:3001](http://localhost:3001). Sign in using the credentials configured for your Compose service.
+
+4. In Grafana, add Prometheus as a data source with the URL `http://prometheus:9090`, which is the service address inside the Compose network. Create dashboard panels using the metrics below or the query examples that follow.
+
+#### Useful Prometheus metrics
+
+| Metric | Meaning |
+|---|---|
+| `vllm_requests_completed_total` | Cumulative number of requests that completed normally. |
+| `vllm_requests_failed_total` | Cumulative number of rejected, failed, or aborted requests, labelled by bounded `error_type`. |
+| `vllm_prompt_tokens_total` | Prompt tokens accounted for across requests, including reused prefix tokens and completed prefill chunks for requests that fail or are aborted. This is an accounting counter, not a measure of newly computed tokens only. |
+| `vllm_generation_tokens_total` | Generated output tokens accounted for, including output emitted before a request fails or is aborted. |
+| `vllm_num_requests_running` / `vllm_num_requests_waiting` | Number of requests currently running and waiting for admission. |
+| `vllm_gpu_cache_usage_factor` | Fraction of physical KV-cache blocks allocated, from `0.0` to `1.0`. |
+| `vllm_gpu_cache_allocated_blocks` / `vllm_gpu_cache_total_blocks` | Allocated KV-cache blocks and total block capacity. |
+| `vllm_prefix_cache_hit_rate` | Ratio of reused prefix tokens to total prompt tokens for the most recently recorded request; this gauge is not a cumulative hit counter. |
+| `vllm_time_to_first_token_seconds` | Histogram of time from request arrival to first generated token, including queue wait. |
+| `vllm_time_per_output_token_seconds` | Histogram of per-token decode latency. |
+| `vllm_e2e_request_latency_seconds` | Histogram of end-to-end request latency. |
+
+Example PromQL queries for dashboard panels:
+
+```promql
+# Completed requests per second, by model
+sum by (model) (rate(vllm_requests_completed_total[5m]))
+
+# Failed requests per second, by model and failure category
+sum by (model, error_type) (rate(vllm_requests_failed_total[5m]))
+
+# Generated output tokens per second, by model
+sum by (model) (rate(vllm_generation_tokens_total[5m]))
+
+# Current KV-cache utilization
+vllm_gpu_cache_usage_factor
+
+# 95th percentile time to first token, by model
+histogram_quantile(0.95, sum by (le, model) (rate(vllm_time_to_first_token_seconds_bucket[5m])))
+```
+
+To stop the monitoring stack, run `docker compose down` from the repository root. Keep the monitoring services local to your development environment unless you have configured appropriate access controls.
+
+---
+
+## Command overview
+
+| Command | Purpose |
+|---|---|
+| `engine` | Run prompts through LocalStrm's engine |
+| `serve` | Start the OpenAI-compatible server |
+| `check` | Memory and hardware preflight |
+| `inspect` | Show model geometry and VRAM breakdown |
+| `list-models` | List models in the local Hugging Face cache |
+| `perf-benchmark`, `benchmark`, `stress-test` | Static vs continuous batching comparisons |
+| `prefix-cache`, `preempt`, `chunked-prefill`, `quantize` | One-concept experiments |
+| `metrics` | Workload plus Prometheus telemetry |
+| `test` | Run the regression suite |
+| `chat` | Interactive terminal chat using Hugging Face (`hf`, default) or the native LocalStrm engine (`localstrm`) via `--engine` |
+Run `python cli.py <command> --help` for every flag. Defaults: model `Qwen/Qwen2.5-0.5B` (or `$MODEL_ID`), device auto-detected (or `$ENGINE_DEVICE`).
+
+---
+
+## How LocalStrm differs from vLLM
+
+| Area | vLLM | LocalStrm |
+|---|---|---|
+| Attention | Fused paged-attention / FlashAttention-style kernels | Gather blocks, then PyTorch SDPA |
+| Execution | CUDA graphs, heavily optimized runtime | Eager PyTorch |
+| Scale | Multi-GPU and multi-node (tensor/pipeline parallelism) | Single GPU |
+| Models | Many architectures | Dense decoder-only models in the LLaMA/Qwen2 style (RMSNorm, RoPE, GQA) |
+| Prefix cache | Hash-based block cache | Hash-based block cache with chained SHA-256 hashes |
+| Not implemented here | | Speculative decoding, LoRA, multimodal inputs, tensor parallelism |
+
+
+The *concepts* (block tables, iteration-level scheduling, hash-based prefix reuse, and recompute preemption) are inspired by the same serving ideas used in vLLM. This is not a claim of feature or performance parity.
+
+---
+
+## Tests
+
+240 tests across 19 modules (`pytest tests/ --collect-only -q`). The latest recorded verification completed all 240 tests: 229 offline tests and 11 model-dependent tests.
 
 ```bash
-python cli.py perf-benchmark --profile smoke --device cuda
+export PYTHONPATH=.
+
+# Offline tier: 16 modules, no internet or model download needed
+pytest tests/test_all_features.py tests/test_api_server.py tests/test_cli_reliability.py \
+       tests/test_cli_serving.py tests/test_gqa_generalization.py tests/test_http_serving.py \
+       tests/test_hybrid_int8.py tests/test_memory_constrained.py tests/test_metrics_lifecycle.py \
+       tests/test_preflight.py tests/test_quantized_loader.py tests/test_reliability.py \
+       tests/test_sampling_parity.py tests/test_scheduler_transitions.py \
+       tests/test_serving_adapter.py tests/test_vram_budget.py -v
+
+# Model-dependent tier: 3 modules, need Qwen/Qwen2.5-0.5B cached locally
+pytest tests/test_batched_runner.py tests/test_int8_long_context.py tests/test_int8_multi_step.py -v
 ```
 
-#### Recipe 7: Live Prometheus Telemetry Server
-
-Process a batch of requests while serving live metrics on port 9090 for Prometheus scraping:
-
-```bash
-python cli.py metrics \
-  --model Qwen/Qwen2.5-0.5B \
-  --serve \
-  --port 9090 \
-  --batch-size 4 \
-  --max-tokens 32
-```
-
-#### Recipe 8: Chained Block-Hash Prefix Cache Deduplication Benchmark
-
-Measure time-to-first-token latency reduction when multiple user queries share an identical system prompt:
-
-```bash
-python cli.py prefix-cache \
-  --model Qwen/Qwen2.5-0.5B \
-  --system-prompt "You are an expert Linux kernel systems engineer. Answer concisely." \
-  --query "How does kswapd work?" \
-  --query "Explain buddy allocator fragmentation."
-```
-
-### 8. Option Compatibility & Troubleshooting
-
-- **KV Cache Budget Mutual Exclusion (`--total-blocks` vs. `--vram-budget`):**
-  You can configure KV cache allocation via explicit block counts (`--total-blocks`) OR an operational memory ceiling (`--vram-budget`), but **never both**. Specifying both flags simultaneously in `cli.py engine` or `cli.py serve` raises an immediate configuration error:
-
-```
-  Error: Conflicting KV-cache configuration: both --total-blocks (N) and --vram-budget ('X') were provided. Specify --total-blocks OR --vram-budget, not both.
-```
-
-- **Serving Engine Backend Constraints:**
-  Options `--total-blocks`, `--vram-budget`, and `--kv-cache-dtype` configure LocalStrm's PagedAttention allocator. If passed to `cli.py serve` when `--engine hf` is selected, they will be ignored with a warning. Use `--engine localstrm` to activate these controls.
-- **Quantization Hardware Requirements:**
-  - `none`: FP16/BF16 weights and compute. Works on all CUDA and CPU devices.
-  - `int8` (W8A16) and `int4` (W4A16): Supported across all CUDA architectures.
-  - `hybrid_int8`: Requires an NVIDIA GPU with compute capability (SM) $\ge 8.0$ (Ampere, Ada Lovelace, Hopper, or newer) and a PyTorch build that provides `torch._int_mm`. Tensor Core execution was not independently verified with hardware performance counters in the reported benchmark.
-- **Fail-Closed Memory Preflight (`--force`):**
-  If preflight memory estimation determines that model weights and minimum KV cache exceed available GPU memory (including the 5% safety margin), LocalStrm refuses to initialize to reduce the risk of CUDA out-of-memory (OOM) failures. In development environments where memory is swapped or shared, pass `--force` to override this safeguard.
-- **Dynamic Defaults and Environment Variables:**
-  - If `--model` is omitted, LocalStrm checks `$MODEL_ID`. If unset, it defaults to `"Qwen/Qwen2.5-0.5B"`.
-  - If `--device` is omitted, LocalStrm checks `$ENGINE_DEVICE`. If unset, it auto-detects `"cuda"` if available, otherwise `"cpu"`.
+Latest recorded results: 229 tests passed in the offline tier (16 modules), and 11 tests passed in the model-dependent tier (3 modules) using cached `Qwen/Qwen2.5-0.5B`. Across both tiers, 240 passed, 0 failed, and 0 skipped. The offline tier uses synthetic tensors and mocks; the model-dependent tier adds checks that run against real model weights. Both sets of commands are shown above. The recorded runs included warnings, so a passing test count does not mean the test run was warning-free.
 
 ---
 
-## Benchmark Studies: Concurrent Serving, Scheduling Efficiency, and Quantized Inference
+## Limitations
 
-> **Reporting scope:** These results summarize distinct experiments recorded during development and validation on the reference RTX 4050 laptop GPU. The studies use different prompts, concurrency levels, measurement boundaries, and objectives; their results should not be compared as though they came from one shared protocol. Raw benchmark JSON files and one-off experiment runners are not bundled in this release snapshot. The general CLI benchmark runners remain available for supported workloads, but they do not automatically reproduce every experiment below.
+- **Single GPU only:** Tensor parallelism and pipeline parallelism across multiple GPUs are not supported.
+- **Native engine model support:** Supports compatible dense, decoder-only transformer architectures following the LLaMA/Qwen2-style layout. Individual models require validation. Hybrid convolution/state-space architectures, such as Liquid LFM3, are not supported by the native engine.
+- **Numerical differences:** Batched decoding can change floating-point reduction order, so greedy outputs may differ from isolated, serial Hugging Face runs. Set `batched_decode=False` to use the serial path for numerical checks.
+- **Server reliability:** Thread-safe request submission is supported, but recovery from unrecoverable CUDA errors is not guaranteed.
+- **Quantization:** Hybrid INT8 quantization can change generated outputs. Its output quality has not yet been comprehensively evaluated.
+- **Attention performance:** LocalStrm gathers non-contiguous KV-cache blocks into contiguous tensors before applying PyTorch SDPA. It does not yet use a fused native paged-attention kernel or CUDA Graphs, so performance may be lower than Hugging Face for some workloads.
 
-### Qwen2.5-0.5B: Concurrent Serving Benchmark (120 Trials)
+## FAQ
 
-This earlier controlled serving benchmark compared a serial Hugging Face baseline with LocalStrm using FP16 and INT8 KV caches, under streaming and non-streaming HTTP request modes.
+### Why can LocalStrm be slower than Hugging Face?
 
-**Experimental setup**
-- **Model:** `Qwen/Qwen2.5-0.5B` with FP16 model weights
-- **Hardware:** NVIDIA GeForce RTX 4050 Laptop GPU (6,141 MiB physical VRAM)
-- **Software:** Python 3.11.15, PyTorch 2.13.0+cu132, CUDA 13.2
-- **Prompt and generation:** Fixed 16-token prompt and 32 output tokens per request
-- **Concurrency:** 1, 2, 4, and 6
-- **Request modes:** Streaming (SSE) and non-streaming HTTP
-- **Configurations:** Hugging Face serial, LocalStrm FP16 KV cache, LocalStrm INT8 KV cache
-- **Repetitions:** 5 measured trials per scenario, totaling 120 trials
+The native engine currently gathers scattered KV-cache blocks into contiguous tensors before running attention. This introduces memory movement, temporary allocations, and execution overhead. A fused paged-attention kernel could reduce these costs, but it has not yet been implemented.
 
-**Median output-token throughput**
+### Why did preflight report `PASS` if inference ran out of memory?
 
-| Concurrency | Request Mode | HF Serial | LocalStrm FP16 KV | FP16 Speedup | LocalStrm INT8 KV | INT8 Speedup |
-|---:|---|---:|---:|---:|---:|---:|
-| 1 | Non-streaming | 63.21 tok/s | 68.20 tok/s | 1.08× | 50.10 tok/s | 0.79× |
-| 1 | Streaming | 61.35 tok/s | 61.67 tok/s | 1.01× | 50.66 tok/s | 0.83× |
-| 2 | Non-streaming | 66.69 tok/s | 121.66 tok/s | 1.82× | 96.30 tok/s | 1.44× |
-| 2 | Streaming | 63.46 tok/s | 112.91 tok/s | 1.78× | 82.94 tok/s | 1.31× |
-| 4 | Non-streaming | 51.43 tok/s | 228.33 tok/s | **4.44×** | 167.17 tok/s | 3.25× |
-| 4 | Streaming | 51.87 tok/s | 224.08 tok/s | **4.32×** | 153.68 tok/s | 2.96× |
-| 6 | Non-streaming | 62.76 tok/s | 178.76 tok/s | 2.85× | 133.32 tok/s | 2.12× |
-| 6 | Streaming | 78.27 tok/s | 179.88 tok/s | 2.30× | 63.26 tok/s | 0.81× |
+Preflight estimates memory requirements, but it cannot account for every activation-memory fluctuation or other processes using the GPU.
 
-At concurrency 4, the reported streaming time-to-first-token (TTFT) was **1,081.3 ms** for the Hugging Face serial baseline and **103.1 ms** for LocalStrm FP16, approximately **10.49× lower latency** in this test.
+If inference runs out of memory, try:
 
-**Interpretation and limitations:** LocalStrm FP16 reached its highest measured throughput in this matrix at concurrency 4. Throughput did not increase monotonically at concurrency 6, and INT8 KV-cache mode was slower than FP16 in the tested scenarios. For non-streaming requests, the report's TTFT field represented full-response latency; streaming TTFT measured arrival of the first SSE chunk. The original validation report was conditional because it also identified an EOS-related `finish_reason` API validation issue. These measurements should not be treated as universal guarantees.
+- Reducing the batch size or maximum number of concurrent requests.
+- Lowering the KV-cache allocation.
+- Shortening the context length.
+- Using a quantized configuration.
 
----
+#### Why might generated output differ between engines?
 
-### Qwen2.5-0.5B: Real-Prompt Scheduling-Waste Benchmark
+Different batching strategies and floating-point reduction orders can produce different token sequences, even with the same model weights and sampling settings. When investigating numerical differences, compare both engines using equivalent decoding configurations.
 
-We evaluated LocalStrm's continuous scheduling against Hugging Face static batching using 16 natural-language questions about LLM and AI systems. The prompt and generation limits were controlled to compare scheduling behavior, rather than to simulate naturally observed user traffic.
+#### What if my model architecture is unsupported by LocalStrm?
 
-**Experimental setup**
-- Model: `Qwen/Qwen2.5-0.5B` (FP16)
-- GPU: NVIDIA GeForce RTX 4050 Laptop GPU (6,141 MiB VRAM)
-- Software: PyTorch 2.13.0+cu132, CUDA 13.2
-- Dataset: 16 natural-language prompts, 5–17 tokens each (mean: 11.3 tokens)
-- Topics include self-attention, tokenization, encoder/decoder models, embeddings, KV caching, continuous batching, PagedAttention, quantization, RAG, sampling, and scheduling waste.
+Use the Hugging Face backend if the model is compatible with your installed Transformers version and its dependencies. The native engine should report an error for unsupported architectures rather than silently falling back to another generation path.
 
-<details>
-<summary>View the 16 natural-language prompts</summary>
+#### Does continuous batching guarantee higher throughput?
 
-1. What is transformer architecture?
-2. Explain self-attention in a transformer.
-3. What is the difference between encoder-only and decoder-only language models?
-4. How does tokenization work in large language models?
-5. Why do transformers use positional encodings?
-6. Explain the role of embeddings in an LLM.
-7. What is the key-value cache during autoregressive generation?
-8. How does continuous batching work in LLM inference serving?
-9. What is paged attention, and why does it help manage memory?
-10. Compare FP16 and INT8 quantization for inference.
-11. Why can batching improve GPU throughput while increasing latency?
-12. Explain retrieval-augmented generation and when it is useful.
-13. What causes GPU out-of-memory errors when serving language models?
-14. How do temperature and top-p sampling affect generated text?
-15. How would you benchmark time to first token and inter-token latency?
-16. How can variable prompt lengths and early-finished requests cause wasted work in static batches?
+No. Continuous batching can improve GPU utilization when requests overlap, but actual throughput depends on concurrency, prompt and output lengths, model size, available GPU resources, and implementation overhead.
 
-</details>
-- Workloads: Uniform 20-token generation targets with simultaneous arrivals, and mixed 16–36-token targets with staggered 0.05-second arrival offsets
-- Concurrency: 1, 2, 4, 8, and 16 requests
-- Engines: Hugging Face static FP16, LocalStrm FP16 KV cache,
-  and LocalStrm INT8 KV cache
-- Repetitions: 3 per test cell, totaling 90 runs
+Use reproducible benchmarks across representative workloads before drawing performance conclusions.
 
-#### Mixed-Workload Sequence-Slot Scheduling Waste
+## Current project status
 
-| Concurrency | HF Static Waste | HF Mean Wasted Sequence-Step Slots per Run | LocalStrm FP16 Waste | LocalStrm INT8 Waste |
-|---:|---:|---:|---:|---:|
-| 1 | 0.0% | 0 | 0.0% | 0.0% |
-| 2 | 15.3% | 74 | 0.0% | 0.0% |
-| 4 | 23.5% | 126 | 0.0% | 0.0% |
-| 8 | 28.8% | 166 | 0.0% | 0.0% |
-| 16 | 28.8% | 166 | 0.0% | 0.0% |
+LocalStrm is an experimental, single-GPU inference engine for studying LLM serving internals. The list below separates implemented capabilities from work that has not yet been implemented.
 
-The waste rate is calculated as `wasted sequence-step slots / (useful slots + wasted sequence-step slots) × 100%`. It measures inactive sequence-slot scheduling waste, not hardware GPU-idle cycles or total GPU compute waste.
+**Implemented and available to experiment with:**
 
-#### Mixed-Workload Output Throughput
+- Paged KV-cache block management, continuous batching, prefix caching, chunked prefill, and preemption/recomputation.
+- INT8 KV-cache storage and the documented weight-quantization paths.
+- OpenAI-compatible API serving, streaming responses, and Prometheus metrics.
+- Model/VRAM preflight checks and regression tests for memory, scheduling, serving, and request lifecycle behavior.
 
-| Concurrency | HF Static FP16 | LocalStrm FP16 KV | LocalStrm INT8 KV |
-|---:|---:|---:|---:|
-| 1 | 22.20 tok/s | 19.86 tok/s | 15.08 tok/s |
-| 2 | 35.45 tok/s | 35.12 tok/s | 26.73 tok/s |
-| 4 | 75.38 tok/s | 48.04 tok/s | 40.36 tok/s |
-| 8 | 146.83 tok/s | 99.44 tok/s | 65.40 tok/s |
-| 16 | 262.51 tok/s | 111.99 tok/s | 91.20 tok/s |
+**Not implemented yet:**
 
-**Interpretation:**
-LocalStrm recorded zero inactive sequence-slot waste under the measured metric. However, eliminating this scheduling waste did not guarantee higher throughput. Hugging Face static batching achieved higher raw throughput at most tested concurrency levels, while LocalStrm FP16 reached near-parity at concurrency 2.
+- A fused native paged-attention kernel; the current attention path gathers KV blocks before calling PyTorch SDPA.
+- CUDA Graphs for decode execution.
+- Multi-GPU tensor or pipeline parallelism.
 
-### Qwen2.5-3B: Quantization and Decode Performance
+Performance optimization and broader model compatibility remain ongoing work. See [Limitations](#limitations) and [Ideas for what to build next](#ideas-for-what-to-build-next) for more detail.
 
-We compared dynamic INT8 execution with LocalStrm's Hybrid INT8 execution using 16 real-prompt questions and repeated measurements on a consumer GPU.
+## Ideas for what to build next
 
-**Experimental setup**
-- Model: `Qwen/Qwen2.5-3B`
-- GPU: NVIDIA GeForce RTX 4050 Laptop GPU (6 GB VRAM)
-- Software: Python 3.11.15, PyTorch 2.13.0+cu132, CUDA 13.2
-- Dataset: 16 natural-language prompts
-- Generation limit: 16 tokens per request
-- Repetitions: 3 measured repetitions per prompt and execution mode
-- Measurements: 96 measured requests in total, excluding one warm-up run per mode
-- Reported execution failures and OOM errors: 0
+Good first extensions if you want to learn by changing the code:
 
-#### Performance Comparison
-
-| Metric | Dynamic INT8 | Hybrid INT8 |
-|---|---:|---:|
-| Decode throughput | 3.07 tok/s | 9.72 tok/s |
-| End-to-end throughput | 3.06 tok/s | 9.60 tok/s |
-| Mean of median TPOT measurements | 325.94 ms | 89.00 ms |
-| Peak allocated VRAM | 3,486.7 MiB | 3,641.5 MiB |
-| Peak reserved VRAM | 3,536.0 MiB | 3,793.3 MiB |
-
-#### Key Findings
-
-- Hybrid INT8 achieved approximately **3.17× decode throughput**.
-- End-to-end throughput improved by approximately **3.13×**.
-- The reported median TPOT measurement decreased by approximately **72.7%**.
-- TTFT showed an approximately **2.70× speedup**.
-- Peak allocated VRAM increased by approximately **154.8 MiB (4.44%)**.
-- Peak reserved VRAM increased by approximately **257.3 MiB**.
-
-**Output consistency:** Exact generated-token matches occurred in 9 of 48 paired requests (18.75%). The remaining 39 pairs differed, so these results must not be interpreted as token-for-token output parity between the two execution modes.
-
-**Measurement limitations:** Tensor Core execution was not independently verified with hardware performance counters during this benchmark. Results reflect the tested model, hardware, prompts, generation limit, and software configuration, and may differ under other workloads.
-
----
-
-## Tests, Supported Configurations & Known Limitations
-
-### Test Suite
-
-The repository includes an automated regression test suite covering the core engine and serving subsystems:
-- **240 tests collected across 19 test modules** (`pytest tests/ --collect-only -q`).
-- Test execution is split between **16 offline test modules** (executable without internet access or model downloads, 229 tests) and **3 model-dependent modules** (requiring local cached weights of `Qwen/Qwen2.5-0.5B`, 11 tests). See [`INSTALL.md`](INSTALL.md) for execution details. All **229 offline tests passed**; all **11 model-dependent integration tests passed** when cached weights are present (240/240 total passing).
-- Tests validate: physical block allocation, block recycling, prefix cache chained block hashing, victim preemption under memory starvation, greedy sampling reproducibility, GQA dimensions, CPU-staged quantization loading, `torch._int_mm` fallbacks, preflight fail-closed guards, live HTTP FastAPI lifecycle events, multi-token stopping criteria vocabulary verification, INT4 slice dequantization numerical equivalence, and fail-closed architecture guards.
-
-### Supported Model Architectures
-
-- **Architecture pattern:** Standard decoder-only transformer architectures with dense linear projections (`model.layers[i]`, RMSNorm, RoPE, and Grouped Query Attention).
-  - **Fully Supported & Verified:** `Qwen/Qwen2.5-0.5B` (Linux x86_64 CUDA, FP16 and INT8 KV-cache, continuous batching, prefix caching, multi-step generation, and HTTP serving verified across 11 integration tests and 90 benchmark runs).
-  - **Smoke-Tested:** `Qwen/Qwen2.5-Coder-1.5B-Instruct` (Linux x86_64 CUDA, INT4 weight quantization via `cli.py chat` with multi-turn conversation and verified stop-token termination).
-  - **Architecture Target (Not Universally Verified):** Structural compatibility targets LLaMA / Qwen2 / Mistral decoder-only families; however, individual checkpoints, alternative precision formats, and unverified backends must be tested individually and are not guaranteed to work without dedicated validation.
-- **Incompatible with `--engine localstrm`:**
-  - **Tri-hybrid architectures:** Models combining gated short convolutions, sliding-window attention, and global attention (such as LiquidAI LFM3 / `liquid_lfm`) do not use standard transformer attention blocks and fail closed with a clear diagnostic error.
-  - **Other non-standard architectures:** Encoder-decoder models (T5), non-standard attention models (Bloom, Falcon, GPT-2), and mixture-of-experts architectures without dense projections. For non-supported models or custom architectures, use `--engine hf`.
-
-### Known Limitations
-
-1. **Single-Node Focus:** Tailored for single-GPU consumer/workstation environments. Does not implement multi-node InfiniBand tensor parallelism.
-2. **Batched Numerical Reproducibility vs. Serial Consistency:** Parallel batched decoding (`batched_decode=True`) is the standard execution path. Different batch shapes can change floating-point reduction order, so greedy token output is not guaranteed to match isolated serial Hugging Face execution across every numerical configuration. An opt-in serial decode mode (`batched_decode=False`) remains available for numerical-contract verification.
-3. **Server Concurrency:** The OpenAI REST server provides asynchronous queueing and SSE streaming. Thread-safe concurrent submission is an MVP implementation; concurrent engine shutdown or recovery from unrecoverable CUDA kernel panics is not guaranteed.
-
----
-
-## Roadmap
-
-- [ ] **Multi-Bucket CUDA Graphs:** Multi-batch CUDA Graph capture for continuous decode batches ($B \in \{1, 2, 4, 8\}$).
-- [ ] **Custom Triton PagedAttention:** Dedicated Triton kernel for paged attention to unify non-contiguous gathering with FlashAttention-style online softmax.
-- [ ] **AWQ / GPTQ 4-Bit Execution:** Native dequantization kernels for pre-packed 4-bit checkpoints.
-- [ ] **Structured Speculative Decoding (Future / In Development):** Draft-target speculative verification with multi-candidate trees (not available in initial release; CLI command omitted pending full multi-candidate validation).
-
----
+- A `--trace` mode that prints per-step scheduler decisions and block tables.
+- Invariant tests for the block manager (blocks never leak, ref counts return to zero).
+- Swapping the gather-plus-SDPA path for a Triton kernel, or adding CUDA graphs for decode.
+- AWQ/GPTQ 4-bit execution and speculative decoding.
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE).
+
+## Acknowledgements
+
+Built to study the ideas of the [vLLM](https://github.com/vllm-project/vllm) project and the PagedAttention paper. Uses [PyTorch](https://pytorch.org/), [Hugging Face Transformers](https://github.com/huggingface/transformers), and [FastAPI](https://fastapi.tiangolo.com/). Example models are from the Qwen team.
